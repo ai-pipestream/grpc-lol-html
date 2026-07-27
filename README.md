@@ -34,9 +34,20 @@ server-side and re-parsing per read, which throws away the one property the
 library exists for.
 
 So server memory stays flat regardless of document size, and **the first
-matches arrive before the last byte has been uploaded**. That is a test, not a
-claim: `matches_arrive_before_the_upload_is_finished` in `tests/extract.rs`
-holds the second half of a document back and still demands its match.
+matches arrive before the last byte has been uploaded**. Both are tests rather
+than claims. `matches_arrive_before_the_upload_is_finished` in
+`tests/extract.rs` holds the second half of a document back and still demands
+its match, and `tests/memory.rs` watches the real server binary's peak RSS
+while feeding it successively larger documents:
+
+```
+  document      1 MiB    16 MiB    64 MiB   128 MiB   256 MiB
+  peak RSS     13 MiB    22 MiB    24 MiB    26 MiB    27 MiB
+```
+
+256 times the document for twice the memory, and nearly all of that is the
+first step, where a freshly started process touches its buffers for the first
+time. Retaining documents would have put the last column at 260 MiB.
 
 You can also watch it happen. `demos/node-client` has a web viewer that POSTs a
 document and reads the events off the same response, drawing matches as they
@@ -154,7 +165,9 @@ common way to get an empty result out of this service.
   64 MiB rather than infinity. Exceeding it is a typed error, or a truncated
   success carrying `bailed_out` if you set `graceful_bail_out`. Either way the
   process survives, which `a_document_over_its_memory_cap_fails_in_band_and_the_server_survives`
-  checks by streaming a second document through afterwards.
+  checks by streaming a second document through afterwards. The cap bounds
+  parser state; what keeps total memory flat is that nothing is retained, which
+  is the table above.
 - **UTF-16 is refused up front.** lol-html's tokenizer scans for ASCII markup
   bytes, so UTF-16LE/BE, ISO-2022-JP and `replacement` are rejected with
   `INVALID_ARGUMENT`. Transcode first.
@@ -222,10 +235,11 @@ hypotheses about where the cost goes that turned out to be wrong.
 
 ```bash
 cargo build --release
-cargo test                                              # 34 tests
+cargo test                                              # 39 tests
 cargo clippy --all-targets --all-features -- -Dwarnings
 buf lint && buf build
 buf generate                                            # regenerate src/gen
+demos/compare-clients.sh                                # needs a running server
 ```
 
 MSRV is 1.88, set by tonic 0.14 rather than by lol-html, which builds on 1.85.
