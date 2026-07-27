@@ -1,0 +1,23 @@
+[package]
+name = "grpc-lol-html-bench"
+version = "0.1.0"
+description = "Honest cost comparison between in-process lol-html, the same work over gRPC, and a DOM-building parser"
+license = "Apache-2.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+# Path dependency, so the benchmark provably links the same lol_html build,
+# the same rule compilation and the same conversion code as the server it
+# measures. Anything else and the comparison is between two different things.
+grpc-lol-html = { path = ".." }
+lol_html = "3.0.0"
+prost = "0.14.4"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+tonic = { version = "0.14.6", features = ["gzip", "zstd"] }
+
+# The DOM reference arm. `scraper` is html5ever plus a selector engine, which
+# is the thing lol-html is deliberately not.
+scraper = "0.22"

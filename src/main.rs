@@ -6,8 +6,11 @@
 //! - `GRPC_LOL_HTML_ADDR` — listen address (default `0.0.0.0:50051`).
 //! - `GRPC_LOL_HTML_WORKERS` — tokio worker threads (default: CPU count).
 //! - `GRPC_LOL_HTML_MAX_CHUNK_BYTES` — largest inbound chunk accepted
-//!   (default: 8 MiB). This bounds how long one uninterruptible parse can
-//!   occupy an async worker; it is not a document size limit.
+//!   (default: 100 MiB). Not a document size limit: a document is any number
+//!   of chunks and has no ceiling. This only bounds how much one message may
+//!   carry, and with it how long a single uninterruptible parse can occupy an
+//!   async worker. Lower it on a host serving many concurrent callers, since
+//!   an in-flight chunk is buffered per call.
 //! - `GRPC_LOL_HTML_WINDOW_BYTES` — HTTP/2 initial stream and connection
 //!   window (default: 4 MiB).
 //!

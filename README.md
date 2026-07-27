@@ -143,8 +143,18 @@ common way to get an empty result out of this service.
 - **UTF-16 is refused up front.** lol-html's tokenizer scans for ASCII markup
   bytes, so UTF-16LE/BE, ISO-2022-JP and `replacement` are rejected with
   `INVALID_ARGUMENT`. Transcode first.
-- **Chunk size is capped** at 8 MiB, so one oversized chunk cannot become one
-  long uninterruptible parse on an async worker.
+- **Chunk size is capped** at 100 MiB, tunable with
+  `GRPC_LOL_HTML_MAX_CHUNK_BYTES`. This is not a document size limit; a
+  document is any number of chunks and has no ceiling. It bounds how much one
+  message carries, and so how long a single uninterruptible parse can hold an
+  async worker. tonic's own decoding limit is derived from it at twice the
+  value, deliberately above rather than equal, so an ordinary overshoot gets
+  the `INVALID_ARGUMENT` that names the limit rather than the transport's
+  `OutOfRange`.
+
+  Sending a chunk that large is allowed but pointless. The benchmark plateaus
+  around 256 KiB: 16 KiB against 1 MiB is roughly 85 against 96 MiB/s, and
+  above that nothing improves while the per-call buffer grows.
 
 ## Two things lol-html gets wrong
 
@@ -170,6 +180,28 @@ and keeps its spans.
 the accessor behind its internal `_integration_test` feature. The field number
 is reserved in the proto rather than shipped always-false, so it can come back
 unchanged if that accessor is ever exposed.
+
+## Is it fast
+
+Faster over the wire than building a DOM in the same process:
+
+```
+  arm                                best        MiB/s  vs native
+  in-process lol-html               49.3ms          324      1.00x
+  over gRPC                        129.7ms          123      2.63x
+  scraper (html5ever + DOM)        168.1ms           95      3.41x
+```
+
+16 MiB synthetic page, 135,426 matched elements, 7 interleaved iterations on a
+32 core host. You pay about 2.6x against in-process lol-html for serialization
+and a socket, and still beat html5ever with a DOM, which pays no transport cost
+at all. Ratios are unchanged at 64 MiB.
+
+`bench/` refuses to print numbers unless the arms agree: every matched element
+folds into an order-sensitive digest, and in-process and over-the-wire must be
+byte-identical. Use 256 KiB upload chunks; throughput plateaus there and buys
+nothing above 1 MiB. See [bench/RESULTS.md](bench/RESULTS.md), including two
+hypotheses about where the cost goes that turned out to be wrong.
 
 ## Building
 

@@ -968,3 +968,53 @@ async fn every_capture_has_a_visible_effect() {
         "end tags must not arrive unless asked for"
     );
 }
+
+/// The documented chunk cap has to be the one that actually fires.
+///
+/// tonic enforces its own decoding limit before any handler runs. If that
+/// limit sits at or below the server's cap, a chunk over the cap is refused by
+/// the transport with `OutOfRange` and a sentence about decoded message
+/// lengths, and the caller never sees the `INVALID_ARGUMENT` that names the
+/// limit and says to split the document.
+///
+/// Run against a deliberately tiny cap so the test costs kilobytes rather than
+/// the 100 MiB the real default would need. The invariant is the same at any
+/// size: overshoot the cap and our error is the one that speaks.
+#[tokio::test]
+async fn an_oversized_chunk_is_refused_by_the_server_not_the_transport() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let service = LolHtmlGrpc::new()
+        .with_max_chunk_bytes(64 * 1024)
+        .into_service();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server failed");
+    });
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .expect("connect");
+    let client = LolHtmlServiceClient::new(channel);
+
+    // Over the 64 KiB cap, under the 128 KiB transport backstop.
+    let oversized = vec![b'x'; 96 * 1024];
+    let err = extract(&client, &oversized, everything(), usize::MAX)
+        .await
+        .expect_err("a chunk over the cap should be refused");
+
+    assert_eq!(
+        err.code(),
+        Code::InvalidArgument,
+        "expected the server's own limit to fire, got {err:?}"
+    );
+    assert!(
+        err.message().contains("exceeds") && err.message().contains("smaller chunks"),
+        "the error should say what to do: {}",
+        err.message()
+    );
+}

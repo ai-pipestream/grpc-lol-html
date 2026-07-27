@@ -53,7 +53,21 @@ const OUTBOUND_BUFFER: usize = 256;
 ///
 /// Not a document size limit: a document is any number of chunks. This bounds
 /// how long one uninterruptible `rewriter.write()` can run on an async worker.
-const DEFAULT_MAX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+///
+/// Generous on purpose, so a caller who wants to hand over a whole document
+/// in one message can. Nothing is gained by it: the benchmark shows upload
+/// throughput plateaus around a 256 KiB chunk, and 16 KiB against 1 MiB is the
+/// difference between roughly 85 and 96 MiB/s. Past that a larger chunk only
+/// buys a longer stretch in which one request occupies a worker and a bigger
+/// transient buffer per in-flight call, so prefer 256 KiB to 1 MiB in a client
+/// unless there is a reason not to.
+///
+/// [`LolHtmlGrpc::into_service`] derives tonic's decoding limit from this, so
+/// the two cannot drift. They did once: this was 8 MiB while tonic's default
+/// stayed at 4 MiB, which made every chunk between the two fail with an opaque
+/// `OutOfRange` from the transport instead of the `INVALID_ARGUMENT` below
+/// that says what to do about it.
+const DEFAULT_MAX_CHUNK_BYTES: usize = 100 * 1024 * 1024;
 
 /// Queue the handlers push into, drained after every chunk.
 type EventSink = mpsc::UnboundedSender<pb::extract_response::Event>;
@@ -86,9 +100,20 @@ impl LolHtmlGrpc {
     }
 
     /// Wrap this service in its generated tonic server.
+    ///
+    /// tonic's decoding limit is set to twice the chunk cap, deliberately
+    /// above it rather than equal to it. The two limits mean different things:
+    /// the cap is advice, refused with an `INVALID_ARGUMENT` that names the
+    /// number and says to split the document, while tonic's is a hard backstop
+    /// against a hostile length prefix. Setting them equal would make the
+    /// backstop fire first for every ordinary overshoot, and the caller would
+    /// get `OutOfRange` and a sentence about decoded message lengths instead
+    /// of the one telling them what to do.
     #[must_use]
     pub fn into_service(self) -> pb::lol_html_service_server::LolHtmlServiceServer<Self> {
+        let backstop = self.max_chunk_bytes.saturating_mul(2);
         pb::lol_html_service_server::LolHtmlServiceServer::new(self)
+            .max_decoding_message_size(backstop)
     }
 }
 

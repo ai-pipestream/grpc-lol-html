@@ -46,3 +46,6 @@ Thumbs.db
 
 # --- Local logs and scratch ---
 *.log
+
+# Bench is its own crate with its own build output.
+bench/target
