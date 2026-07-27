@@ -1,0 +1,380 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Core data model for the lol-html gRPC service.
+//
+// Every message and enum in this file is a one-to-one mapping of a public
+// type from Cloudflare's Rust `lol_html` crate
+// (https://github.com/cloudflare/lol-html). The mapping is intentionally
+// structural: where lol-html has a Rust enum we have a protobuf enum with the
+// same arms in the same meaning, and where it exposes a byte range we expose
+// the byte range rather than a rendered string.
+//
+// The one place the mapping is deliberately *not* one-to-one is text: see
+// `TextType` and the `raw_text_chunks` option in the service file.
+
+syntax = "proto3";
+
+package lolhtml.v1;
+
+option java_multiple_files = true;
+option java_outer_classname = "TypesProto";
+
+// SourceSpan is a byte range in the input document.
+//
+// Mirrors `lol_html::html_content::SourceLocation::bytes()`. Two properties
+// routinely surprise callers, so they are stated here rather than left to be
+// discovered:
+//
+//  1. The offsets are **bytes, not characters**, and they index the document
+//     in its *original* character encoding. If the document was windows-1251
+//     and you are holding a decoded UTF-8 string, these offsets do not index
+//     that string.
+//  2. lol-html tracks no line or column numbers, and there is no cheap way to
+//     derive them from a streaming parse. If you need them, count newlines in
+//     your own copy of the bytes.
+//
+// Spans are unaffected by any rewriting: they always describe the input.
+message SourceSpan {
+  // Zero-based byte offset of the first byte, inclusive.
+  uint64 start = 1;
+
+  // Zero-based byte offset one past the last byte, exclusive.
+  uint64 end = 2;
+}
+
+// Namespace mirrors the element namespaces lol-html distinguishes.
+//
+// A streaming parser still tracks foreign content, so an `<a>` inside `<svg>`
+// is reported as SVG rather than HTML. This matters for extraction: SVG and
+// MathML subtrees usually carry no indexable prose, and their tag names
+// collide with HTML ones.
+enum Namespace {
+  // Zero value. Never sent by the server.
+  NAMESPACE_UNSPECIFIED = 0;
+
+  // The HTML namespace, `http://www.w3.org/1999/xhtml`.
+  NAMESPACE_HTML = 1;
+
+  // The SVG namespace, `http://www.w3.org/2000/svg`.
+  NAMESPACE_SVG = 2;
+
+  // The MathML namespace, `http://www.w3.org/1998/Math/MathML`.
+  NAMESPACE_MATHML = 3;
+}
+
+// TextType mirrors `lol_html::html_content::TextType`.
+//
+// Not all text in a document is prose. A client that concatenates every text
+// event indexes minified JavaScript and CSS as body copy, which is why this
+// type is on every text event and why the service filters on it by default.
+//
+// Only `DATA` and `RCDATA` are HTML-entity decoded (lol-html's
+// `TextType::allows_html_entities()`); the rest arrive exactly as written, so
+// `&amp;` stays `&amp;` inside a `<script>`.
+enum TextType {
+  // Zero value. Never sent by the server.
+  TEXT_TYPE_UNSPECIFIED = 0;
+
+  // Regular text. Entity decoded. This is the prose you almost certainly want.
+  TEXT_TYPE_DATA = 1;
+
+  // Text inside `<title>` and `<textarea>`. Entity decoded. Usually wanted:
+  // the document title lives here.
+  TEXT_TYPE_RCDATA = 2;
+
+  // Text inside `<style>`, `<xmp>`, `<iframe>`, `<noembed>`, `<noframes>` and
+  // `<noscript>`. Not entity decoded.
+  TEXT_TYPE_RAW_TEXT = 3;
+
+  // Text inside `<script>`. Not entity decoded.
+  TEXT_TYPE_SCRIPT_DATA = 4;
+
+  // Text inside `<plaintext>`. Interpreted literally to the end of the
+  // document; no escaping is possible.
+  TEXT_TYPE_PLAIN_TEXT = 5;
+
+  // Text inside a CDATA section, which only occurs in foreign content
+  // (SVG and MathML). Not entity decoded.
+  TEXT_TYPE_CDATA_SECTION = 6;
+}
+
+// Attribute is a single attribute on a start tag.
+//
+// Mirrors `lol_html::html_content::Attribute`.
+message Attribute {
+  // Attribute name, lowercased, as `Attribute::name()` returns it. This is
+  // the form to compare against.
+  string name = 1;
+
+  // Attribute name exactly as it was written in the document. Differs from
+  // `name` only in case, and only matters in foreign content, where
+  // `viewBox` and `viewbox` are not the same attribute.
+  string name_raw = 2;
+
+  // Attribute value, entity decoded. Empty for a bare attribute such as the
+  // `defer` in `<script defer>`.
+  string value = 3;
+
+  // Byte range of the attribute name in the input.
+  //
+  // This and `value_span` are present or absent together, because lol-html
+  // records one position for the pair. Both are absent when source locations
+  // were not requested.
+  //
+  // Both are also always absent for a **bare** attribute, one written with no
+  // `=value` at all, such as the `defer` in `<script defer>`. lol-html
+  // reports a position for those that is not a position: it varies with how
+  // the document was chunked and can point at bytes belonging to a different
+  // part of the tag. The server drops the pair rather than pass that on. An
+  // explicitly empty value, `foo=""`, is a real location and keeps its spans.
+  optional SourceSpan name_span = 4;
+
+  // Byte range of the attribute value in the input, covering the value itself
+  // and not the surrounding quotes or the `=`.
+  //
+  // See `name_span` for when this is absent.
+  optional SourceSpan value_span = 5;
+}
+
+// MemoryLimits caps what a single Extract call may allocate.
+//
+// Mirrors `lol_html::MemorySettings`. The parser buffers whenever it cannot
+// yet decide how to interpret what it has seen, and a document can be crafted
+// to make that buffer grow without bound, so a server that accepts untrusted
+// HTML needs this set.
+message MemoryLimits {
+  // Hard cap in bytes on the parser's buffered state. Zero means the server's
+  // own default rather than "unlimited"; a server accepting arbitrary input
+  // should never run unlimited.
+  uint64 max_bytes = 1;
+
+  // What to do when `max_bytes` is reached.
+  //
+  // When true the rewriter bails out gracefully: the stream ends with a
+  // `finished` event carrying `bailed_out`, and everything already emitted
+  // stands. When false the stream ends with a terminal `error` event instead.
+  // Either way the server survives; this only chooses how the truncation is
+  // reported.
+  bool graceful_bail_out = 2;
+
+  // Bytes to preallocate for the parsing buffer, per call.
+  //
+  // Mirrors `MemorySettings::preallocated_parsing_buffer_size`. Zero means
+  // lol-html's default of 1 KiB. Raising it trades memory for fewer regrowths
+  // on documents known to buffer heavily; it is a tuning knob, not a limit.
+  uint64 preallocated_buffer_bytes = 3;
+}
+
+// Capture selects what an ExtractRule reports when its selector matches.
+//
+// Captures are additive: ask for what you will read and nothing else, because
+// every capture costs wire bytes on every match.
+enum Capture {
+  // Zero value. A rule with no captures is rejected as almost certainly a
+  // mistake.
+  CAPTURE_UNSPECIFIED = 0;
+
+  // The matched element's tag name, both normalized and as written.
+  CAPTURE_TAG_NAME = 1;
+
+  // Every attribute on the matched element's start tag.
+  CAPTURE_ATTRIBUTES = 2;
+
+  // Text inside the matched element, as `text` events tagged with this rule's
+  // id. Subject to the call's `text_types` filter.
+  CAPTURE_TEXT = 3;
+
+  // HTML comments inside the matched element, as `comment` events tagged with
+  // this rule's id.
+  CAPTURE_COMMENTS = 4;
+
+  // Byte ranges: the element's own span, and the name and value spans of each
+  // captured attribute.
+  CAPTURE_SOURCE_LOCATION = 5;
+
+  // The matched element's end tag, as an `end_tag` event tagged with this
+  // rule's id.
+  //
+  // No end tag event is emitted for a void or self-closing element, nor for
+  // an element the document never closes. Do not use this as a reliable
+  // "element finished" signal on untrusted markup.
+  CAPTURE_END_TAG = 6;
+}
+
+// ExtractRule is one CSS selector and what to report when it matches.
+message ExtractRule {
+  // Caller-chosen identifier, echoed as `rule_id` on every event this rule
+  // produces. Need not be unique, though overlapping ids make the output
+  // ambiguous. Rules are independent: an element matching three rules
+  // produces three events.
+  string id = 1;
+
+  // A CSS selector, compiled by lol-html's selector VM.
+  //
+  // The supported subset is wider than "no tree, no selectors" would suggest,
+  // and the dividing line is worth knowing before you write rules.
+  //
+  // Supported: `*`, `E`, `E F`, `E > F`, `.class`, `#id`, `:not(s)`, every
+  // attribute operator including `^=`, `$=`, `*=`, `~=`, `|=` and the `i`/`s`
+  // case flags, plus `:nth-child(n)`, `:first-child`, `:nth-of-type(n)` and
+  // `:first-of-type`.
+  //
+  // Rejected because the answer lies in markup the parser has not read yet:
+  // `:last-child`, `:only-child`, `:nth-last-child(n)`, `:last-of-type`,
+  // `:only-of-type`, `:has(s)`.
+  //
+  // Rejected as unimplemented: the sibling combinators `+` and `~`.
+  //
+  // Rejected as out of scope for a token stream: namespaced selectors such as
+  // `svg|a`, and pseudo-elements such as `::before`.
+  //
+  // `:first-child` against `:last-child` is the whole idea: an element is
+  // known to be first the moment it is seen, and cannot be known to be last
+  // until its parent closes. None of these rejections are pending work.
+  //
+  // Use `ValidateSelectors` to check before spending an upload.
+  string selector = 2;
+
+  // What to report on a match. At least one is required.
+  repeated Capture captures = 3;
+}
+
+// DocumentRule captures content that lies outside every element, and which no
+// CSS selector can therefore reach.
+//
+// Mirrors `lol_html::DocumentContentHandlers`. The doctype, and any comment
+// before `<html>` or after `</html>`, are only reachable this way.
+message DocumentRule {
+  // Identifier echoed as `rule_id` on events this rule produces. Defaults to
+  // `"document"` when empty.
+  string id = 1;
+
+  // Report the document type declaration as a `doctype` event.
+  bool doctype = 2;
+
+  // Report document-level comments as `comment` events.
+  bool comments = 3;
+
+  // Report document-level text as `text` events, subject to the call's
+  // `text_types` filter.
+  bool text = 4;
+}
+
+// SelectorErrorCode mirrors every variant of `lol_html::errors::SelectorError`.
+//
+// Typed so a client can branch on the failure rather than match on English.
+// lol-html's own deprecated and unreachable `EmptyNegation` variant is
+// deliberately absent.
+enum SelectorErrorCode {
+  // Zero value. Never sent by the server.
+  SELECTOR_ERROR_CODE_UNSPECIFIED = 0;
+
+  // Unexpected token in the selector.
+  SELECTOR_ERROR_CODE_UNEXPECTED_TOKEN = 1;
+
+  // The selector ended in the middle of a construct.
+  SELECTOR_ERROR_CODE_UNEXPECTED_END = 2;
+
+  // An attribute selector with no attribute name, such as `[=x]`.
+  SELECTOR_ERROR_CODE_MISSING_ATTRIBUTE_NAME = 3;
+
+  // The selector was empty.
+  SELECTOR_ERROR_CODE_EMPTY_SELECTOR = 4;
+
+  // The selector ended in a combinator, such as `div >`.
+  SELECTOR_ERROR_CODE_DANGLING_COMBINATOR = 5;
+
+  // Unexpected token inside an attribute selector.
+  SELECTOR_ERROR_CODE_UNEXPECTED_TOKEN_IN_ATTRIBUTE = 6;
+
+  // A pseudo-class or pseudo-element the matcher cannot evaluate: one whose
+  // answer depends on markup after the element (`:last-child`,
+  // `:only-child`, `:nth-last-child`, `:last-of-type`, `:only-of-type`,
+  // `:has`), or a pseudo-element, which has nothing to match in a token
+  // stream. Note that the forward-looking siblings of these, `:first-child`
+  // and `:nth-child(n)`, are supported. Permanent, not pending.
+  SELECTOR_ERROR_CODE_UNSUPPORTED_PSEUDO_CLASS_OR_ELEMENT = 7;
+
+  // A negation nested inside another negation.
+  SELECTOR_ERROR_CODE_NESTED_NEGATION = 8;
+
+  // A selector with an explicit namespace, such as `svg|a`. Not supported.
+  SELECTOR_ERROR_CODE_NAMESPACED_SELECTOR = 9;
+
+  // An invalid or unescaped class name.
+  SELECTOR_ERROR_CODE_INVALID_CLASS_NAME = 10;
+
+  // A combinator the selector VM does not implement, namely the sibling
+  // combinators `+` and `~`. `detail` names the character. Descendant and
+  // child combinators are supported.
+  SELECTOR_ERROR_CODE_UNSUPPORTED_COMBINATOR = 11;
+
+  // CSS syntax that is valid but that the selector VM does not implement.
+  SELECTOR_ERROR_CODE_UNSUPPORTED_SYNTAX = 12;
+}
+
+// SelectorDiagnostic reports one selector that failed to compile.
+message SelectorDiagnostic {
+  // The `ExtractRule.id` whose selector failed, or `"document"` where the
+  // failure was not attributable to a rule.
+  string rule_id = 1;
+
+  // The selector text as submitted.
+  string selector = 2;
+
+  // Typed reason.
+  SelectorErrorCode code = 3;
+
+  // lol-html's own message, for logs and humans. Do not parse this.
+  string message = 4;
+
+  // The offending character, for the codes that name one. Empty otherwise.
+  string detail = 5;
+}
+
+// ParseErrorCode mirrors every variant of `lol_html::errors::RewritingError`.
+enum ParseErrorCode {
+  // Zero value. Never sent by the server.
+  PARSE_ERROR_CODE_UNSPECIFIED = 0;
+
+  // The parser needed more buffered state than `MemoryLimits.max_bytes`
+  // allowed. Seen as an error only when `graceful_bail_out` was false;
+  // otherwise the run ends with a `finished` event carrying `bailed_out`.
+  PARSE_ERROR_CODE_MEMORY_LIMIT_EXCEEDED = 1;
+
+  // The document reached a state where a streaming parser cannot determine
+  // the correct parsing context, and lol-html refused to guess. See
+  // `ExtractOptions.strict`.
+  PARSE_ERROR_CODE_PARSING_AMBIGUITY = 2;
+
+  // A content handler failed. The server's handlers only fail when the
+  // response stream has already gone away, so a client should not normally
+  // observe this.
+  PARSE_ERROR_CODE_CONTENT_HANDLER_ERROR = 3;
+}
+
+// StreamError is a terminal, in-band failure.
+//
+// It arrives as the last event of an otherwise well-formed stream, and the
+// RPC then completes with an OK status. Everything emitted before it is valid
+// and may be kept. Errors that are detectable before parsing starts, such as
+// an uncompilable selector or an unsupported encoding, are returned as a gRPC
+// status instead and no stream is opened at all.
+message StreamError {
+  // Typed reason.
+  ParseErrorCode code = 1;
+
+  // lol-html's own message, for logs and humans. Do not parse this.
+  string message = 2;
+
+  // Field 3 was `uint64 offset`, removed before first release.
+  //
+  // It reported how many bytes had been handed to the parser when the failure
+  // surfaced, which reads like an error position and is not one: lol-html
+  // reports no position for these errors, and the number moved with the
+  // caller's chunk size, so the same document failing the same way produced
+  // different offsets. A field that looks like a locator but is really "how
+  // much you had uploaded" is worse than no field.
+  reserved 3;
+  reserved "offset";
+}

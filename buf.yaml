@@ -1,0 +1,12 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  # Strictest built-in rule set plus mandatory documentation comments on
+  # every message, enum, enum value, field, oneof, rpc, and service.
+  use:
+    - STANDARD
+    - COMMENTS
+breaking:
+  use:
+    - FILE

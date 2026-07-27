@@ -1,0 +1,7 @@
+[default.extend-words]
+# Protobuf field/type shorthand mirrored from calamine's public API.
+typ = "typ"
+
+[files]
+# Generated code is not hand-written prose.
+extend-exclude = ["src/gen/**"]

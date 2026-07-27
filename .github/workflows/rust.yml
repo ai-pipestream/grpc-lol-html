@@ -1,0 +1,55 @@
+name: Rust
+
+on: [ push, pull_request ]
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        toolchain:
+          - "1.88"  # MSRV, set by tonic 0.14 rather than by lol-html (1.85).
+          - stable
+          - beta
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+          toolchain: ${{ matrix.toolchain }}
+    - name: Toolchain version
+      run: |
+        cargo -vV
+        rustc -vV
+    - name: Build
+      run: |
+        cargo build
+    - name: Run tests
+      run: |
+        cargo test
+    - name: Install rustfmt, clippy
+      uses: dtolnay/rust-toolchain@master
+      if: ${{ matrix.toolchain == 'stable' }}
+      with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+    - name: Format checks
+      if: ${{ matrix.toolchain == 'stable' }}
+      run: |
+        cargo fmt -- --check
+    - name: Clippy checks
+      if: ${{ matrix.toolchain == 'stable' }}
+      run: |
+        cargo clippy --all-targets --all-features -- -Dwarnings
+
+  proto:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: bufbuild/buf-action@v1
+      with:
+        setup_only: true
+    - name: Lint the protobuf contract
+      run: |
+        buf lint
+        buf build

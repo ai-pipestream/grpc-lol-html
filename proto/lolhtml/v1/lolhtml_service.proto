@@ -1,0 +1,364 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// gRPC service contract for the lol-html extraction server.
+//
+// The server runs Cloudflare's `lol_html` streaming rewriter over HTML the
+// caller uploads, and reports what CSS selectors matched, as they match.
+//
+// The protocol is **not** handle-based, and that is the central design
+// decision rather than an omission. lol-html is a forward-only transducer:
+// bytes go in, events come out, nothing is retained, and there is no document
+// to go back and read a second time. Holding the document server-side to
+// offer a handle would discard the one property the library exists for. So
+// `Extract` is bidirectional: chunks flow in while events flow out, the first
+// events arrive before the last byte has been uploaded, and server memory
+// stays flat regardless of document size.
+//
+// There is no unary convenience RPC. lol-html's in-memory `rewrite_str` path
+// cannot honour an encoding or a memory limit, so a unary RPC built on it
+// would silently drop the two settings that make this safe to point at the
+// open web.
+
+syntax = "proto3";
+
+package lolhtml.v1;
+
+import "lolhtml/v1/types.proto";
+
+option java_multiple_files = true;
+option java_outer_classname = "LolHtmlServiceProto";
+
+// LolHtmlService exposes lol-html over gRPC.
+//
+// Named for the library rather than for `Extract`, because a service name is
+// baked into every method path and is therefore the one thing in this file
+// that cannot be changed additively later. Rewriting is lol-html's other half
+// and will arrive as a second RPC on this same service.
+service LolHtmlService {
+  // Extracts selector matches from a document, streaming both ways.
+  //
+  // The first request message must carry `options`; every subsequent message
+  // carries a `chunk` of document bytes, in order. Half-close the request
+  // stream to signal the end of the document.
+  //
+  // The response stream always begins with `started` and always ends with
+  // either `finished` or `error`, whatever happens in between.
+  //
+  // Send the `options` frame before waiting on the response. The server
+  // validates options before it opens the response stream, so it produces no
+  // response headers until it has them; a client that feeds the request from
+  // a queue and awaits the call first will wait forever. Clients that build
+  // the whole request as an iterator never notice this.
+  rpc Extract(stream ExtractRequest) returns (stream ExtractResponse);
+
+  // Compiles selectors and reports which ones are invalid, without sending a
+  // document.
+  //
+  // Selector mistakes are the most common way to get an empty result from
+  // this service, and a selector that a browser accepts may still be
+  // rejected here: nothing requiring whole-tree context can be evaluated by
+  // a parser that never builds a tree. Checking costs one cheap round trip.
+  rpc ValidateSelectors(ValidateSelectorsRequest) returns (ValidateSelectorsResponse);
+}
+
+// ExtractRequest is one frame of the request stream.
+message ExtractRequest {
+  // Exactly one per stream, in the order given.
+  oneof frame {
+    // Must be the first frame. Sending it twice is an error.
+    ExtractOptions options = 1;
+
+    // A chunk of document bytes, in document order. Chunks are concatenated;
+    // where the boundaries fall has no effect on the events produced, and the
+    // test suite pins that by replaying every fixture at several chunk sizes.
+    //
+    // Chunk size is a throughput knob only. The server rejects a chunk larger
+    // than its configured cap, because one oversized chunk is one long
+    // uninterruptible parse.
+    bytes chunk = 2;
+  }
+}
+
+// ExtractOptions configures a single Extract call.
+message ExtractOptions {
+  // Selector-scoped rules. May be empty if `document_rule` is set, which is
+  // how you ask only for the doctype.
+  repeated ExtractRule rules = 1;
+
+  // Content outside every element, which no selector can reach. Optional.
+  DocumentRule document_rule = 2;
+
+  // Character encoding of the document, as a label such as `utf-8` or
+  // `windows-1251`. Empty means `utf-8`.
+  //
+  // Must be ASCII-compatible. UTF-16LE, UTF-16BE, ISO-2022-JP and
+  // `replacement` are rejected with INVALID_ARGUMENT: lol-html's tokenizer
+  // scans for ASCII markup bytes and cannot operate on an encoding where
+  // those bytes do not mean what they say. Transcode to UTF-8 first.
+  string encoding = 3;
+
+  // Let a `<meta charset>` in the document override `encoding` mid-parse.
+  //
+  // Real pages disagree with their own Content-Type header often enough that
+  // this is usually worth enabling. Per the HTML spec an explicit charset in
+  // the transport header outranks the meta tag, so if you have a trustworthy
+  // header, pass it as `encoding` and leave this off.
+  bool adjust_charset_on_meta_tag = 4;
+
+  // Let the parser guess on markup it cannot resolve, instead of bailing out.
+  //
+  // Certain constructs, `<select><xmp><script>` being the canonical one,
+  // parse differently depending on tree state a streaming parser does not
+  // have. lol-html refuses to pick, because picking wrong is what turned
+  // Cloudflare's own security features into XSS gadgets. Setting this makes
+  // it pick and continue, which is defensible for markup you produced and is
+  // not defensible for the open web.
+  //
+  // Conforming markup never triggers the bail-out, so leaving this alone
+  // costs nothing on real documents.
+  //
+  // Phrased as an opt-in to the unsafe behaviour rather than as lol-html's
+  // own `strict` flag on purpose: proto3 has no field presence for bools, so
+  // a `strict` field would arrive as false from every client that did not set
+  // it, and the safe default has to be the zero value.
+  bool allow_ambiguous_markup = 5;
+
+  // Recognize ESI tags (`<esi:include>` and friends) as elements.
+  bool enable_esi_tags = 6;
+
+  // Memory cap for this call. Strongly recommended for untrusted input; see
+  // MemoryLimits.
+  MemoryLimits limits = 7;
+
+  // Emit raw text fragments instead of whole text nodes.
+  //
+  // lol-html splits text at buffer boundaries, so one text node can arrive as
+  // any number of fragments. By default the server reassembles them and emits
+  // one `text` event per text node, which is what almost every caller wants
+  // and which is why a naive client of this service works.
+  //
+  // Setting this true gives you the fragments as lol-html produced them, with
+  // `last_in_node` marking the end of each node. That keeps server memory
+  // constant even for a single enormous text node, at the cost of doing the
+  // reassembly yourself. Reassembling in order reproduces the default output
+  // exactly.
+  bool raw_text_chunks = 8;
+
+  // Which kinds of text to report. Empty means `[DATA, RCDATA]`, that is,
+  // prose and titles.
+  //
+  // The default exists because concatenating every text event is the obvious
+  // thing to do and silently indexes minified JavaScript and CSS as body
+  // copy. Ask for SCRIPT_DATA or RAW_TEXT explicitly if you want them.
+  repeated TextType text_types = 9;
+}
+
+// ExtractResponse is one event of the response stream.
+message ExtractResponse {
+  // Exactly one per message. A stream always opens with `started` and always
+  // closes with `finished` or `error`.
+  //
+  // Unknown variants must be ignored rather than treated as failures: this
+  // oneof is the extension point, and a future server may add events an old
+  // client has no name for.
+  oneof event {
+    // Always the first event.
+    ExtractStarted started = 1;
+
+    // A selector matched an element.
+    ElementMatched element = 2;
+
+    // Text, either inside a matched element or at document level.
+    TextNode text = 3;
+
+    // An HTML comment.
+    CommentFound comment = 4;
+
+    // The document type declaration.
+    DoctypeFound doctype = 5;
+
+    // The end tag of a previously matched element.
+    EndTagFound end_tag = 6;
+
+    // Always the last event of a successful run.
+    ExtractFinished finished = 7;
+
+    // Always the last event of a failed run. Terminal; nothing follows.
+    StreamError error = 8;
+  }
+}
+
+// ExtractStarted opens every response stream.
+message ExtractStarted {
+  // The encoding actually in use, which is the requested one resolved to a
+  // canonical label. If `adjust_charset_on_meta_tag` is set, a `<meta
+  // charset>` later in the document may still change it.
+  string encoding = 1;
+
+  // How many rules compiled. Equals the number submitted; a stream is never
+  // opened with a rule that failed to compile.
+  uint32 rule_count = 2;
+}
+
+// ElementMatched reports one element matching one rule.
+//
+// It is emitted on the element's **start tag**, before its content has been
+// parsed, which is what makes early streaming possible. Nothing about the
+// element's children is known yet.
+message ElementMatched {
+  // The `ExtractRule.id` that matched. An element matching several rules
+  // produces one event per rule.
+  string rule_id = 1;
+
+  // Tag name, lowercased. Empty unless CAPTURE_TAG_NAME was requested.
+  string tag_name = 2;
+
+  // Tag name as written in the document. Differs from `tag_name` only in
+  // case, which is significant in foreign content.
+  string tag_name_raw = 3;
+
+  // Which namespace the element is in.
+  Namespace namespace = 4;
+
+  // True for a syntactically self-closing tag such as `<br/>`. Note that in
+  // HTML content this is largely decorative: `<div/>` is not self-closing no
+  // matter how it is written.
+  bool self_closing = 5;
+
+  // False for a void element such as `<img>`, which can never have children
+  // and will never produce an end tag.
+  bool can_have_content = 6;
+
+  // Attributes on the start tag. Empty unless CAPTURE_ATTRIBUTES was
+  // requested.
+  repeated Attribute attributes = 7;
+
+  // Byte range of the start tag. Absent unless CAPTURE_SOURCE_LOCATION was
+  // requested.
+  optional SourceSpan span = 8;
+}
+
+// TextNode is text content.
+message TextNode {
+  // The rule whose element contains this text, or the DocumentRule id for
+  // text outside every element.
+  string rule_id = 1;
+
+  // The text. Entity decoded only for DATA and RCDATA; see TextType.
+  string text = 2;
+
+  // What kind of text this is. Always set, and worth checking before you
+  // treat it as prose.
+  TextType text_type = 3;
+
+  // Byte range. Absent unless CAPTURE_SOURCE_LOCATION was requested.
+  optional SourceSpan span = 4;
+
+  // Whether this is the final fragment of its text node.
+  //
+  // Always true in the default mode, where the server has already reassembled
+  // the node. Meaningful only when `raw_text_chunks` was set, where it marks
+  // the boundary you would reassemble on.
+  bool last_in_node = 5;
+}
+
+// CommentFound is an HTML comment.
+message CommentFound {
+  // The rule whose element contains this comment, or the DocumentRule id for
+  // a comment outside every element.
+  string rule_id = 1;
+
+  // Comment text, without the `<!--` and `-->` delimiters.
+  string text = 2;
+
+  // Byte range including the delimiters. Absent unless
+  // CAPTURE_SOURCE_LOCATION was requested.
+  optional SourceSpan span = 3;
+}
+
+// DoctypeFound is the document type declaration.
+//
+// Only reachable through a DocumentRule, since no selector matches it.
+message DoctypeFound {
+  // The DocumentRule id.
+  string rule_id = 1;
+
+  // The root element name, `html` for anything modern. Absent if the
+  // declaration omitted it.
+  optional string name = 2;
+
+  // The public identifier, present only in legacy doctypes.
+  optional string public_id = 3;
+
+  // The system identifier, present only in legacy doctypes.
+  optional string system_id = 4;
+
+  // Field 5 was `bool force_quirks`, removed before first release.
+  //
+  // lol-html computes it, but gates the accessor behind its internal
+  // `_integration_test` feature, so it is not reachable from a normal build
+  // and a server cannot report it honestly. The number stays reserved so it
+  // can come back unchanged if that accessor is ever made public.
+  reserved 5;
+  reserved "force_quirks";
+
+  // Byte range. Absent unless CAPTURE_SOURCE_LOCATION was requested.
+  optional SourceSpan span = 6;
+}
+
+// EndTagFound is the closing tag of a previously matched element.
+//
+// Emitted only for rules that asked for CAPTURE_END_TAG, and only for
+// elements that actually close. A void element, a self-closing tag, and an
+// element the document simply never closes all produce no end tag event, so
+// this is not a dependable "element finished" signal on untrusted markup.
+message EndTagFound {
+  // The rule whose element this closes.
+  string rule_id = 1;
+
+  // Tag name, lowercased.
+  string name = 2;
+
+  // Tag name as written in the document.
+  string name_raw = 3;
+
+  // Byte range. Absent unless CAPTURE_SOURCE_LOCATION was requested.
+  optional SourceSpan span = 4;
+}
+
+// ExtractFinished closes every successful response stream.
+message ExtractFinished {
+  // Total document bytes the server parsed.
+  uint64 bytes_parsed = 1;
+
+  // Per-rule match counts, keyed by `ExtractRule.id`. A rule that matched
+  // nothing is present with a zero count, so a client can tell "no matches"
+  // apart from "no such rule".
+  map<string, uint64> matches_by_rule = 2;
+
+  // Whether the run ended early through a graceful bail-out rather than by
+  // reaching the end of the document.
+  //
+  // When true the events already delivered are valid but the document was
+  // not fully parsed. This is what `MemoryLimits.graceful_bail_out` produces.
+  bool bailed_out = 3;
+
+  // Why the run bailed out, for logs and humans. Empty when `bailed_out` is
+  // false.
+  string bail_out_reason = 4;
+}
+
+// ValidateSelectorsRequest asks whether a set of selectors compiles.
+message ValidateSelectorsRequest {
+  // The rules to compile. Only `id` and `selector` are read; `captures` is
+  // ignored, so the same rules you would send to Extract can be passed
+  // through unchanged.
+  repeated ExtractRule rules = 1;
+}
+
+// ValidateSelectorsResponse reports which selectors failed.
+message ValidateSelectorsResponse {
+  // One entry per selector that failed to compile, in submission order.
+  // Empty means every selector compiled.
+  repeated SelectorDiagnostic diagnostics = 1;
+}

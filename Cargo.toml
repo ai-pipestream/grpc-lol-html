@@ -1,0 +1,32 @@
+[package]
+name = "grpc-lol-html"
+version = "0.1.0"
+description = "A gRPC server that streams CSS-selector matches out of HTML parsed with lol-html"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["html", "grpc", "streaming", "lol-html", "scraping"]
+categories = ["parsing", "network-programming"]
+edition = "2024"
+# lol-html itself builds on 1.85, but tonic 0.14 and tonic-prost 0.14 both
+# declare 1.88, so the transport sets the floor rather than the parser.
+rust-version = "1.88"
+publish = false # Server binary plus demos; not a library for crates.io.
+# `bench/` is its own crate with a path dependency back on this one, so it is
+# built and run explicitly and never lands in this package or in CI.
+exclude = ["bench", "demos"]
+
+[dependencies]
+encoding_rs = "0.8.35" # Charset label lookup, the same version lol-html uses.
+lol_html = "3.0.0"
+prost = "0.14.4"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tonic = { version = "0.14.6", features = ["gzip", "zstd"] }
+tonic-prost = "0.14.6"
+
+[dev-dependencies]
+tokio-stream = { version = "0.1.19", features = ["net"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
