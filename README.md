@@ -61,7 +61,7 @@ This is the load-bearing test, and it earned its keep: it is what caught both
 of the upstream problems described under "Two things lol-html gets wrong",
 below. Neither was visible from reading the library's documentation.
 
-## The four things clients get wrong
+## The five things clients get wrong
 
 ### 1. Text chunks are not text nodes
 
@@ -75,7 +75,22 @@ Set `raw_text_chunks` if you want the fragments, which keeps server memory
 constant even for a single enormous text node; concatenating a node's fragments
 in order reproduces the reassembled text exactly.
 
-### 2. Not all text is prose
+### 2. It does not run JavaScript
+
+No engine, no DOM, no fetching of `<script src>`. This is a tokenizer, and
+whatever the server sent is what you get.
+
+It does extract script *source*, which is the useful half: structured data
+lives in `<script type="application/ld+json">` on most commercial pages, and a
+selector reaches it. Price, availability and rating without a browser.
+
+The limit that follows is real. On a client-rendered app the content is not in
+the HTML at all: `sample-data/spa_shell.html` yields the string `Loading…` and
+nothing else, because the `<div id="root">` is filled by a bundle this service
+will never run. If you need the post-JavaScript DOM, render it with a headless
+browser first and feed the result here.
+
+### 3. Not all text is prose
 
 `TextType` distinguishes six kinds of text, and a client that concatenates
 every text event indexes minified JavaScript and CSS as body copy.
@@ -85,7 +100,7 @@ The default filter is `[DATA, RCDATA]`: prose, plus the `<title>` and
 `RAW_TEXT` by name if you want them. Only `DATA` and `RCDATA` are
 entity-decoded, so the rest arrive exactly as written.
 
-### 3. Ambiguous markup is refused, not guessed
+### 4. Ambiguous markup is refused, not guessed
 
 On markup like `<select><xmp><script>` lol-html declines to pick a parse,
 because picking wrong is what turned Cloudflare's own security features into
@@ -98,7 +113,7 @@ no field presence for bools, so a `strict` field would arrive as `false` from
 every client that had not heard of it, and the safe behaviour has to be the
 zero value. Conforming markup never triggers the bail-out.
 
-### 4. Send the options frame before you await the response
+### 5. Send the options frame before you await the response
 
 The server validates options before opening the response stream, so it emits no
 response headers until it has them. A client that feeds the request from a

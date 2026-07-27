@@ -39,6 +39,8 @@ const FIXTURES: &[(&str, &str)] = &[
     ("deep_nesting.html", ""),
     ("doctype_legacy.html", ""),
     ("duplicate_and_bare_attrs.html", ""),
+    ("json_ld_product.html", ""),
+    ("spa_shell.html", ""),
     ("script_and_style_text.html", ""),
     ("text_split_boundary.html", ""),
     ("unclosed_tags.html", ""),

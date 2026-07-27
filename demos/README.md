@@ -87,6 +87,46 @@ explain.
 already excludes `<script>` and `<style>`, but if you pass `--script-text` you
 get them and they are not prose.
 
+## It does not run JavaScript
+
+Worth being blunt about, because the two halves of this get conflated.
+
+**It never executes anything.** No JavaScript engine, no DOM, no fetching of
+`<script src>`. This is a tokenizer. Whatever the server sent is what you get.
+
+**It does extract script *source*.** That is `TEXT_TYPE_SCRIPT_DATA`, filtered
+out by default and available on request. Which makes the genuinely useful case
+work: structured data lives in `<script type="application/ld+json">` on most
+commercial pages, and a selector reaches it.
+
+```bash
+node cli.js ../sample-data/json_ld_product.html \
+    'script[type="application/ld+json"]' --script-text
+```
+
+```
+text ... {"@context":"https://schema.org","@type":"Product","name":"Wireless Headphones",
+          "offers":{"price":"349.00","priceCurrency":"USD"},
+          "aggregateRating":{"ratingValue":"4.6","reviewCount":"2841"}}
+```
+
+Price, availability and rating, without a browser.
+
+**The consequence is a real limit.** On a client-rendered app, the interesting
+content does not exist in the HTML at all:
+
+```bash
+node cli.js ../sample-data/spa_shell.html '*' --script-text
+```
+
+Everything indexable on that page is the string `Loading…` and the sentence
+`You need to enable JavaScript to run this app.` The `<div id="root">` is
+empty, because it is filled by a bundle that this service will never run.
+
+If you need the post-JavaScript DOM, render it first with a headless browser
+and feed the result here. That costs a browser per page rather than about
+120 ms per 15 MiB, so it is worth knowing which of your pages actually need it.
+
 ## Sample data
 
 [`sample-data/`](sample-data) holds small hand-written HTML files, each pinning
@@ -105,6 +145,8 @@ them at six different chunk sizes and compare the streams in full.
 | `doctype_legacy.html` | a doctype carrying public and system identifiers |
 | `unclosed_tags.html` | elements that never close, so no end-tag events |
 | `duplicate_and_bare_attrs.html` | attribute case, bare attributes, and their spans |
+| `json_ld_product.html` | structured data in a `<script type="application/ld+json">` |
+| `spa_shell.html` | a page whose content does not exist until JavaScript runs |
 
 These are all tiny, because each one exists to pin a single hazard. For
 something that looks like real work, see
