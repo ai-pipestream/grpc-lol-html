@@ -1,0 +1,347 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>grpc-lol-html: watch HTML stream</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfd;      --panel: #fff;    --ink: #16181d;   --dim: #6a7080;
+    --line: #e2e5ec;    --accent: #2f6df6; --live: #12a150; --warn: #d1442f;
+    --svg: #8b5cf6;     --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1014;    --panel: #171a21; --ink: #e6e8ee;   --dim: #949bab;
+      --line: #262b36;  --accent: #6b9bff; --live: #37d67a; --warn: #ff7a63;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header { padding: 24px 24px 8px; }
+  h1 { margin: 0; font-size: 20px; letter-spacing: -.01em; }
+  h1 code { font: 600 19px/1 var(--mono); color: var(--accent); }
+  .sub { margin: 6px 0 0; color: var(--dim); max-width: 62ch; }
+  main { padding: 16px 24px 40px; display: grid; gap: 16px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px 16px;
+  }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+  label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+  select, input[type=text] {
+    font: 13px var(--mono); padding: 7px 9px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  input[type=text] { min-width: 260px; }
+  button {
+    font: 600 13px system-ui; padding: 8px 16px; border-radius: 7px; border: 0;
+    background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  .throttle { display: flex; align-items: center; gap: 8px; }
+  .throttle input { width: 130px; }
+  .hint { font-size: 12px; color: var(--dim); }
+
+  /* Upload bar with a marker where the first match landed. */
+  .track {
+    position: relative; height: 26px; border-radius: 6px;
+    background: var(--bg); border: 1px solid var(--line); overflow: hidden;
+  }
+  .fill { height: 100%; width: 0; background: var(--accent); opacity: .22; transition: width .08s linear; }
+  .mark { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--live); display: none; }
+  .track-label {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: space-between; padding: 0 10px;
+    font: 11px var(--mono); color: var(--dim);
+  }
+  .verdict { margin-top: 10px; font-size: 14px; }
+  .verdict strong { color: var(--live); }
+  .verdict.idle { color: var(--dim); }
+
+  .stats { display: flex; flex-wrap: wrap; gap: 22px; }
+  .stat b { display: block; font: 600 20px/1.2 var(--mono); }
+  .stat span { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+
+  .split { display: grid; grid-template-columns: minmax(0, 1fr) 230px; gap: 16px; }
+  @media (max-width: 820px) { .split { grid-template-columns: 1fr; } }
+
+  #feed { height: 46vh; min-height: 260px; overflow-y: auto; font: 12.5px/1.65 var(--mono); }
+  .ev { padding: 1px 0; border-bottom: 1px solid transparent; }
+  .ev.new { animation: flash .5s ease-out; }
+  @keyframes flash { from { background: color-mix(in srgb, var(--live) 26%, transparent); } }
+  .k { color: var(--dim); }
+  .tag { color: var(--accent); font-weight: 600; }
+  .tag.svg { color: var(--svg); }
+  .attr { color: var(--ink); }
+  .txt { color: var(--live); }
+  .err { color: var(--warn); font-weight: 600; }
+  .rule { color: var(--dim); }
+
+  table { width: 100%; border-collapse: collapse; font: 12.5px var(--mono); }
+  th { text-align: left; font-weight: 600; color: var(--dim); padding-bottom: 6px; }
+  td { padding: 2px 0; }
+  td.n { text-align: right; }
+  footer { padding: 0 24px 32px; color: var(--dim); font-size: 12.5px; max-width: 74ch; }
+  footer code { font-family: var(--mono); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Watching <code>grpc-lol-html</code> parse</h1>
+  <p class="sub">
+    One HTTP request carries the document up while events come back down, the
+    same shape as the gRPC call underneath. Matches are drawn the moment the
+    Rust server finds them, which is why they show up before the upload bar
+    fills. Slow the upload to watch it happen.
+  </p>
+</header>
+
+<main>
+  <div class="panel controls">
+    <div>
+      <label for="sample">Document</label>
+      <select id="sample"></select>
+    </div>
+    <div>
+      <label for="selectors">Selectors, comma separated</label>
+      <input id="selectors" type="text" value="a[href], h1, h2, p">
+    </div>
+    <div class="throttle">
+      <div>
+        <label for="delay">Upload throttle</label>
+        <input id="delay" type="range" min="0" max="120" step="10" value="40">
+      </div>
+      <span class="hint"><span id="delayLabel">40 ms / chunk</span><br><span id="chunkLabel"></span></span>
+    </div>
+    <button id="run">Stream it</button>
+  </div>
+
+  <div class="panel">
+    <div class="track">
+      <div class="fill" id="fill"></div>
+      <div class="mark" id="mark" title="first match"></div>
+      <div class="track-label"><span id="fedLabel">idle</span><span id="sizeLabel"></span></div>
+    </div>
+    <p class="verdict idle" id="verdict">Pick a document and press stream.</p>
+  </div>
+
+  <div class="panel stats">
+    <div class="stat"><b id="sEvents">0</b><span>events</span></div>
+    <div class="stat"><b id="sMatches">0</b><span>matches</span></div>
+    <div class="stat"><b id="sText">0</b><span>text nodes</span></div>
+    <div class="stat"><b id="sMs">0</b><span>ms to first match</span></div>
+    <div class="stat"><b id="sEnc">&ndash;</b><span>encoding</span></div>
+  </div>
+
+  <div class="split">
+    <div class="panel">
+      <div id="feed"></div>
+    </div>
+    <div class="panel">
+      <table>
+        <thead><tr><th>Rule</th><th class="n">Hits</th></tr></thead>
+        <tbody id="counts"></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+
+<footer>
+  The throttle delays the <em>upload</em> only, to make streaming visible on a
+  file that would otherwise finish inside one animation frame. The parser never
+  waits for anything but bytes. Try
+  <code>ambiguity_select_xmp_script.html</code> to see the server refuse to
+  guess at ambiguous markup, and <code>cdata_svg.html</code> to see two
+  <code>&lt;a&gt;</code> elements distinguished only by namespace.
+</footer>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const feed = $("feed");
+
+// Keep the DOM bounded: a large page can emit tens of thousands of events and
+// the browser is not the thing this demo is trying to stress.
+const MAX_ROWS = 600;
+
+let sizeBytes = 0;
+
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const clip = (s, n = 90) => (s.length > n ? s.slice(0, n) + "…" : s);
+const kb = (n) => (n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KiB`);
+
+async function loadSamples() {
+  const { files } = await (await fetch("/api/samples")).json();
+  $("sample").innerHTML = files.map((f) => `<option>${esc(f)}</option>`).join("");
+  if (files.includes("cdata_svg.html")) $("sample").value = "cdata_svg.html";
+}
+
+$("delay").addEventListener("input", (e) => {
+  $("delayLabel").textContent = `${e.target.value} ms / chunk`;
+});
+
+function row(html) {
+  const div = document.createElement("div");
+  div.className = "ev new";
+  div.innerHTML = html;
+  feed.append(div);
+  while (feed.childElementCount > MAX_ROWS) feed.firstElementChild.remove();
+  feed.scrollTop = feed.scrollHeight;
+}
+
+/** Render one event as a feed row, or null to skip it. */
+function render(kind, d) {
+  switch (kind) {
+    case "started":
+      return `<span class="k">started</span> encoding=<b>${esc(d.encoding)}</b> rules=${d.ruleCount}`;
+    case "element": {
+      const svg = d.namespace && d.namespace !== "NAMESPACE_HTML";
+      const ns = svg ? ` <span class="k">${esc(d.namespace.replace("NAMESPACE_", ""))}</span>` : "";
+      const attrs = (d.attributes ?? [])
+        .map((a) => ` <span class="attr">${esc(a.name)}="${esc(clip(a.value, 40))}"</span>`)
+        .join("");
+      return `<span class="tag${svg ? " svg" : ""}">&lt;${esc(d.tagName)}&gt;</span>${attrs}${ns}`
+        + ` <span class="rule">${esc(d.ruleId)}</span>`;
+    }
+    case "text":
+      if (!d.text.trim()) return null;
+      return `<span class="k">text</span> <span class="txt">${esc(clip(d.text))}</span>`
+        + ` <span class="rule">${esc(d.textType.replace("TEXT_TYPE_", ""))}</span>`;
+    case "doctype":
+      return `<span class="k">doctype</span> ${esc(d.name ?? "")}`;
+    case "comment":
+      return `<span class="k">comment</span> ${esc(clip(d.text, 60))}`;
+    case "endTag":
+      return null; // structurally interesting, visually noise
+    case "finished":
+      return `<span class="k">finished</span> ${d.bytesParsed} bytes`
+        + (d.bailedOut ? ` <span class="err">bailed out: ${esc(d.bailOutReason)}</span>` : "");
+    case "error":
+      return `<span class="err">${esc(d.code)}</span> ${esc(clip(d.message, 160))}`;
+    case "grpc-error":
+      return `<span class="err">rpc failed</span> ${esc(d.message)}`;
+    default:
+      return null;
+  }
+}
+
+async function run() {
+  const button = $("run");
+  button.disabled = true;
+  feed.innerHTML = "";
+  $("counts").innerHTML = "";
+  $("mark").style.display = "none";
+  $("fill").style.width = "0";
+  $("verdict").className = "verdict idle";
+  $("verdict").textContent = "streaming…";
+  for (const id of ["sEvents", "sMatches", "sText", "sMs"]) $(id).textContent = "0";
+  $("sEnc").textContent = "–";
+
+  const file = $("sample").value;
+  const body = await (await fetch(`/api/samples/${file}`)).arrayBuffer();
+  sizeBytes = body.byteLength;
+  $("sizeLabel").textContent = kb(sizeBytes);
+
+  const params = new URLSearchParams();
+  for (const s of $("selectors").value.split(",").map((x) => x.trim()).filter(Boolean)) {
+    params.append("selector", s);
+  }
+  params.set("delayMs", $("delay").value);
+
+  // Aim for roughly 40 upload steps whatever the document size, so a 300 byte
+  // fixture and a 300 KiB page both show the same thing. Chunk size changes
+  // nothing about the events, only how finely you get to watch them arrive.
+  const chunkBytes = Math.min(65536, Math.max(16, Math.ceil(sizeBytes / 40)));
+  params.set("chunkBytes", chunkBytes);
+  $("chunkLabel").textContent = `${chunkBytes} B chunks`;
+
+  const started = performance.now();
+  let events = 0, matches = 0, texts = 0, fed = 0, firstMatchAt = null;
+  const counts = new Map();
+
+  const res = await fetch(`/api/extract?${params}`, { method: "POST", body });
+  if (!res.ok) {
+    const problem = await res.json();
+    row(`<span class="err">${esc(problem.error)}</span> `
+      + esc((problem.diagnostics ?? []).map((d) => `${d.ruleId}: ${d.message}`).join("; ")));
+    button.disabled = false;
+    return;
+  }
+
+  // SSE over a POST response, so it has to be parsed by hand: EventSource
+  // only does GET, and the whole point here is that the upload and the event
+  // stream are one request.
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let split;
+    while ((split = buffer.indexOf("\n\n")) !== -1) {
+      const raw = buffer.slice(0, split);
+      buffer = buffer.slice(split + 2);
+
+      const kind = raw.match(/^event: (.*)$/m)?.[1];
+      const data = JSON.parse(raw.match(/^data: (.*)$/m)?.[1] ?? "{}");
+      if (!kind) continue;
+
+      if (kind === "fed") {
+        fed = data.bytes;
+        $("fill").style.width = `${(fed / sizeBytes) * 100}%`;
+        $("fedLabel").textContent = `${kb(fed)} fed to the parser`;
+        continue;
+      }
+      if (kind === "done") continue;
+
+      events++;
+      if (kind === "started") $("sEnc").textContent = data.encoding;
+      if (kind === "element") {
+        matches++;
+        counts.set(data.ruleId, (counts.get(data.ruleId) ?? 0) + 1);
+        if (firstMatchAt === null) {
+          firstMatchAt = fed;
+          const pct = (fed / sizeBytes) * 100;
+          $("mark").style.left = `${pct}%`;
+          $("mark").style.display = "block";
+          $("sMs").textContent = Math.round(performance.now() - started);
+          $("verdict").className = "verdict";
+          $("verdict").innerHTML = `First match after <strong>${kb(fed)} of ${kb(sizeBytes)}</strong>`
+            + ` (${pct.toFixed(0)}% uploaded). The rest of the document had not been sent yet.`;
+        }
+      }
+      if (kind === "text" && data.text.trim()) texts++;
+
+      const html = render(kind, data);
+      if (html) row(html);
+
+      $("sEvents").textContent = events;
+      $("sMatches").textContent = matches;
+      $("sText").textContent = texts;
+      $("counts").innerHTML = [...counts.entries()]
+        .map(([id, n]) => `<tr><td>${esc(clip(id, 22))}</td><td class="n">${n}</td></tr>`)
+        .join("");
+    }
+  }
+
+  if (firstMatchAt === null) {
+    $("verdict").className = "verdict idle";
+    $("verdict").textContent = "No element matched. Try a different selector.";
+  }
+  button.disabled = false;
+}
+
+$("run").addEventListener("click", run);
+await loadSamples();
+</script>
+</body>
+</html>

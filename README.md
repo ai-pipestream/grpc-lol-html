@@ -38,6 +38,18 @@ matches arrive before the last byte has been uploaded**. That is a test, not a
 claim: `matches_arrive_before_the_upload_is_finished` in `tests/extract.rs`
 holds the second half of a document back and still demands its match.
 
+You can also watch it happen. `demos/node-client` has a web viewer that POSTs a
+document and reads the events off the same response, drawing matches as they
+land and marking the byte where the first one arrived:
+
+```bash
+cargo run --release &
+cd demos/node-client && npm install && npm start   # http://127.0.0.1:8080
+```
+
+> First match after **48 B of 305 B** (16% uploaded). The rest of the document
+> had not been sent yet.
+
 ## Where you split the upload is invisible
 
 Chunk size is a throughput knob and nothing else. `tests/extract.rs` replays

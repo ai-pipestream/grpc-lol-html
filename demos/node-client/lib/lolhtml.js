@@ -43,20 +43,37 @@ export class LolHtmlClient {
   }
 
   /**
-   * Stream a document and yield each event as it arrives.
+   * Open an Extract call and send the options frame.
    *
-   * Note the ordering below: the options frame is written before anything
-   * awaits the response. The server validates options before it opens the
-   * response stream, so it produces no response headers until it has them.
+   * The caller then writes `{ chunk }` frames as the document becomes
+   * available and calls `.end()`. This is the shape to use when the document
+   * is itself arriving from somewhere, since it never holds the whole thing:
+   * `server.js` pipes an HTTP upload straight through it.
+   *
+   * Note the ordering: options go out before anything reads the response. The
+   * server validates them before opening the response stream, so it produces
+   * no response headers until it has them, and a caller that waits first
+   * waits forever.
+   *
+   * @param {object} options an ExtractOptions message.
+   * @returns {object} the duplex call.
+   */
+  openExtract(options) {
+    const call = this.stub.extract();
+    call.write({ options });
+    return call;
+  }
+
+  /**
+   * Stream a whole in-memory document and yield each event as it arrives.
    *
    * @param {Buffer} bytes the document.
    * @param {object} options an ExtractOptions message.
    * @returns {AsyncGenerator<object>} ExtractResponse messages.
    */
   async *extract(bytes, options) {
-    const call = this.stub.extract();
+    const call = this.openExtract(options);
 
-    call.write({ options });
     for (let at = 0; at < bytes.length; at += CHUNK_BYTES) {
       call.write({ chunk: bytes.subarray(at, at + CHUNK_BYTES) });
     }

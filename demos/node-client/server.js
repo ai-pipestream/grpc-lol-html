@@ -1,0 +1,236 @@
+#!/usr/bin/env node
+// SPDX-License-Identifier: Apache-2.0
+//
+// Web demo: a dependency-light HTTP bridge in front of grpc-lol-html.
+//
+// The interesting part is that there is only one request. The browser POSTs a
+// document and reads Server-Sent Events off the *same* response, so the HTTP
+// call has the same shape as the gRPC call underneath it: bytes flowing one
+// way while events flow the other. Nothing here buffers the document; each
+// upload chunk is written into the gRPC call as it lands, and each event is
+// flushed to the browser as the Rust server emits it.
+//
+// That is what the page is for. Matches appear while the upload bar is still
+// filling, and the "first match" readout says how far in they started.
+//
+//   node server.js            # http://127.0.0.1:8080
+//
+// Environment: LOL_HTML_ADDR (default 127.0.0.1:50051), PORT (default 8080).
+
+import { createServer } from "node:http";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import { LolHtmlClient } from "./lib/lolhtml.js";
+
+const PORT = Number(process.env.PORT ?? 8080);
+const ADDR = process.env.LOL_HTML_ADDR ?? "127.0.0.1:50051";
+const client = new LolHtmlClient(ADDR);
+const publicDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "public");
+
+/** Largest artificial upload delay accepted, in ms per chunk. */
+const MAX_DELAY_MS = 2000;
+
+/**
+ * Bytes per chunk fed into the gRPC call.
+ *
+ * The bridge re-slices the incoming body rather than forwarding whatever
+ * Node's HTTP layer happened to hand it, because for a small file that is one
+ * buffer, and a single chunk makes the whole demo invisible: the upload bar
+ * would jump to full before the first event. Chunk size does not change the
+ * events, which the Rust test suite pins by replaying every fixture at six
+ * different sizes. It only changes how much of this you get to watch.
+ */
+const DEFAULT_CHUNK_BYTES = 256;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function sendJson(res, status, body) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+/** Format one SSE event frame. */
+function frame(event, data) {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+/** Build ExtractOptions from the query string. */
+function optionsFrom(url) {
+  const selectors = url.searchParams.getAll("selector").filter(Boolean);
+  const captures = [
+    "CAPTURE_TAG_NAME",
+    "CAPTURE_ATTRIBUTES",
+    "CAPTURE_TEXT",
+    "CAPTURE_END_TAG",
+  ];
+  if (url.searchParams.has("spans")) captures.push("CAPTURE_SOURCE_LOCATION");
+
+  return {
+    rules: (selectors.length > 0 ? selectors : ["title", "a[href]", "h1, h2, h3"]).map(
+      (selector, i) => ({ id: selector || `r${i}`, selector, captures }),
+    ),
+    documentRule: { id: "document", doctype: true, comments: true, text: false },
+    encoding: url.searchParams.get("encoding") ?? "",
+    adjustCharsetOnMetaTag: true,
+    allowAmbiguousMarkup: url.searchParams.has("allowAmbiguous"),
+    rawTextChunks: url.searchParams.has("rawText"),
+    textTypes: url.searchParams.has("scriptText")
+      ? ["TEXT_TYPE_DATA", "TEXT_TYPE_RCDATA", "TEXT_TYPE_SCRIPT_DATA", "TEXT_TYPE_RAW_TEXT"]
+      : [],
+  };
+}
+
+/**
+ * Pipe one upload through Extract, streaming events back on the same response.
+ *
+ * `delayMs` sleeps between upload chunks. It is there to make the streaming
+ * visible on a small local file, where the whole thing would otherwise be
+ * uploaded and parsed inside a single frame of animation. It slows the upload
+ * only; the parser is never waiting on anything but bytes.
+ */
+async function bridge(req, res, url) {
+  const options = optionsFrom(url);
+  const delayMs = Math.min(Number(url.searchParams.get("delayMs") ?? 0) || 0, MAX_DELAY_MS);
+
+  // Selector mistakes are the most common way to get an empty result. Catch
+  // them before the browser spends an upload on it.
+  const { diagnostics } = await client.validateSelectors(options.rules);
+  if (diagnostics.length > 0) {
+    return sendJson(res, 400, { error: "bad selectors", diagnostics });
+  }
+
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+    // The page is watching for the first event; a proxy that buffers would
+    // hide the only thing this demo exists to show.
+    "x-accel-buffering": "no",
+  });
+
+  const call = client.openExtract(options);
+  let closed = false;
+
+  // proto-loader's `oneofs: true` sets `message.event` to the name of the
+  // active arm, so an arm this bridge has never heard of still forwards
+  // rather than being dropped on the floor.
+  call.on("data", (message) => {
+    const kind = message.event;
+    if (!kind) return;
+    if (!res.write(frame(kind, message[kind] ?? {}))) {
+      // The browser is behind. Stop pulling events until it drains, rather
+      // than queueing the whole document's worth in this process. The pause
+      // propagates back through gRPC flow control to the parser itself.
+      call.pause();
+      res.once("drain", () => call.resume());
+    }
+  });
+  call.on("error", (err) => {
+    if (!closed) {
+      closed = true;
+      res.write(frame("grpc-error", { message: err.details ?? err.message }));
+      res.end();
+    }
+  });
+  call.on("end", () => {
+    if (!closed) {
+      closed = true;
+      res.write(frame("done", {}));
+      res.end();
+    }
+  });
+
+  // If the browser goes away, stop parsing rather than finish into a void.
+  res.on("close", () => {
+    if (!closed) {
+      closed = true;
+      call.cancel();
+    }
+  });
+
+  const chunkBytes = Math.max(
+    1,
+    Number(url.searchParams.get("chunkBytes") ?? 0) || DEFAULT_CHUNK_BYTES,
+  );
+
+  let fed = 0;
+  try {
+    for await (const buffer of req) {
+      for (let at = 0; at < buffer.length; at += chunkBytes) {
+        if (closed) break;
+        const chunk = buffer.subarray(at, at + chunkBytes);
+        call.write({ chunk });
+        fed += chunk.length;
+        // The page draws its upload bar from this, so it measures what the
+        // parser has actually been handed, not what the browser has queued.
+        res.write(frame("fed", { bytes: fed }));
+        if (delayMs > 0) await sleep(delayMs);
+      }
+      if (closed) break;
+    }
+    if (!closed) call.end();
+  } catch {
+    if (!closed) {
+      closed = true;
+      call.cancel();
+      res.end();
+    }
+  }
+}
+
+const server = createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  try {
+    if (req.method === "POST" && url.pathname === "/api/extract") {
+      return await bridge(req, res, url);
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/samples") {
+      const dir = path.join(publicDir, "..", "..", "sample-data");
+      const { readdir } = await import("node:fs/promises");
+      const files = (await readdir(dir)).filter((f) => f.endsWith(".html")).sort();
+      return sendJson(res, 200, { files });
+    }
+
+    const sample = url.pathname.match(/^\/api\/samples\/([\w.-]+)$/);
+    if (req.method === "GET" && sample) {
+      const file = path.join(publicDir, "..", "..", "sample-data", sample[1]);
+      res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+      return res.end(await readFile(file));
+    }
+
+    // Static front end. no-store: this is a live demo page, never let the
+    // browser run a stale copy of it.
+    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
+      const html = await readFile(path.join(publicDir, "index.html"));
+      res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+      });
+      return res.end(html);
+    }
+    if (req.method === "GET" && url.pathname === "/favicon.ico") {
+      res.writeHead(204);
+      return res.end();
+    }
+
+    sendJson(res, 404, { error: "not found" });
+  } catch (err) {
+    sendJson(res, 502, { error: err.details ?? err.message });
+  }
+});
+
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`port ${PORT} is already in use, another bridge instance?`);
+    console.error(`stop it, or run with a different port: PORT=8081 npm start`);
+    process.exit(1);
+  }
+  throw err;
+});
+
+server.listen(PORT, () => {
+  console.log(`lol-html web demo on http://127.0.0.1:${PORT}`);
+  console.log(`forwarding to grpc-lol-html at ${ADDR}`);
+});
