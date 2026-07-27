@@ -17,7 +17,7 @@ const positional = argv.filter((a) => !a.startsWith("--"));
 const [file, ...selectors] = positional;
 
 if (!file) {
-  console.error("usage: node cli.js <file.html> [selector...] [--spans] [--script-text] [--raw-text] [--allow-ambiguous] [--encoding=LABEL]");
+  console.error("usage: node cli.js <file.html> [selector...] [--spans] [--script-text] [--all-text] [--raw-text] [--allow-ambiguous] [--encoding=LABEL]");
   process.exit(2);
 }
 
@@ -41,10 +41,23 @@ const options = {
   adjustCharsetOnMetaTag: true,
   allowAmbiguousMarkup: flags.has("--allow-ambiguous"),
   rawTextChunks: flags.has("--raw-text"),
-  textTypes: flags.has("--script-text")
-    ? ["TEXT_TYPE_DATA", "TEXT_TYPE_RCDATA", "TEXT_TYPE_SCRIPT_DATA", "TEXT_TYPE_RAW_TEXT"]
-    : [],
+  textTypes: textTypes(),
 };
+
+// Empty means the server's default of prose plus titles. `--script-text` adds
+// the two that make up most of a real page's bytes; `--all-text` adds the last
+// two as well, which only turn up in `<plaintext>` and in CDATA sections
+// inside foreign content.
+function textTypes() {
+  if (flags.has("--all-text")) {
+    return ["TEXT_TYPE_DATA", "TEXT_TYPE_RCDATA", "TEXT_TYPE_RAW_TEXT",
+            "TEXT_TYPE_SCRIPT_DATA", "TEXT_TYPE_PLAIN_TEXT", "TEXT_TYPE_CDATA_SECTION"];
+  }
+  if (flags.has("--script-text")) {
+    return ["TEXT_TYPE_DATA", "TEXT_TYPE_RCDATA", "TEXT_TYPE_SCRIPT_DATA", "TEXT_TYPE_RAW_TEXT"];
+  }
+  return [];
+}
 
 const client = new LolHtmlClient();
 

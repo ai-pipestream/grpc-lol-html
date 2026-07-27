@@ -40,6 +40,8 @@ const FIXTURES: &[(&str, &str)] = &[
     ("doctype_legacy.html", ""),
     ("duplicate_and_bare_attrs.html", ""),
     ("json_ld_product.html", ""),
+    ("mathml_formula.html", ""),
+    ("plaintext_tail.html", ""),
     ("spa_shell.html", ""),
     ("script_and_style_text.html", ""),
     ("text_split_boundary.html", ""),
@@ -968,6 +970,240 @@ async fn every_capture_has_a_visible_effect() {
     assert!(
         only!(tag, Event::EndTag).is_empty(),
         "end tags must not arrive unless asked for"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Exhaustiveness: every variant in the contract, produced by real input
+// ---------------------------------------------------------------------------
+//
+// `convert::text_type` and `errors::selector_code` are exhaustive matches over
+// lol-html's own enums, so a library upgrade that *adds* a variant is a compile
+// error rather than an `UNSPECIFIED` quietly reaching clients. These tests are
+// the other half: proof that every variant the contract declares is actually
+// produced by real input, and a record of what produces it.
+//
+// Each is driven by an exhaustive match on the wire enum, so declaring a
+// variant in the proto without giving it a source is also a compile error, and
+// each checks that the contract has no variant numbered past the ones named
+// here, which is the same guarantee for the list itself.
+
+/// Options that match everything and ask for every kind of text.
+fn every_text_type() -> pb::ExtractOptions {
+    pb::ExtractOptions {
+        text_types: ALL_TEXT_TYPES
+            .iter()
+            .map(|text_type| *text_type as i32)
+            .collect(),
+        ..everything()
+    }
+}
+
+const ALL_TEXT_TYPES: [pb::TextType; 7] = [
+    pb::TextType::Unspecified,
+    pb::TextType::Data,
+    pb::TextType::Rcdata,
+    pb::TextType::RawText,
+    pb::TextType::ScriptData,
+    pb::TextType::PlainText,
+    pb::TextType::CdataSection,
+];
+
+/// The fixture that produces each text type, and the markup in it that does.
+const fn text_type_source(text_type: pb::TextType) -> Option<(&'static str, &'static str)> {
+    use pb::TextType as T;
+    match text_type {
+        T::Unspecified => None,
+        T::Data => Some(("script_and_style_text.html", "<p>")),
+        T::Rcdata => Some(("script_and_style_text.html", "<title> and <textarea>")),
+        T::RawText => Some(("script_and_style_text.html", "<style> and <noscript>")),
+        T::ScriptData => Some(("script_and_style_text.html", "<script>")),
+        T::PlainText => Some(("plaintext_tail.html", "<plaintext>")),
+        T::CdataSection => Some(("cdata_svg.html", "<![CDATA[ ]]> inside <svg>")),
+    }
+}
+
+/// Every text type is reachable from a committed fixture, and `UNSPECIFIED` is
+/// not reachable at all.
+#[tokio::test]
+async fn every_text_type_is_produced_by_a_fixture() {
+    assert!(
+        pb::TextType::try_from(ALL_TEXT_TYPES.len() as i32).is_err(),
+        "the contract grew a text type this list does not name"
+    );
+
+    let client = start_server().await;
+
+    for text_type in ALL_TEXT_TYPES {
+        let Some((fixture, markup)) = text_type_source(text_type) else {
+            continue;
+        };
+        let events = extract_file(&client, fixture, every_text_type(), 64).await;
+        let seen: Vec<i32> = only!(events, Event::Text)
+            .iter()
+            .map(|text| text.text_type)
+            .collect();
+        assert!(
+            seen.contains(&(text_type as i32)),
+            "{text_type:?} should come from {markup} in {fixture}, saw {seen:?}"
+        );
+        assert!(
+            !seen.contains(&(pb::TextType::Unspecified as i32)),
+            "{fixture} produced an unspecified text type"
+        );
+    }
+}
+
+const ALL_NAMESPACES: [pb::Namespace; 4] = [
+    pb::Namespace::Unspecified,
+    pb::Namespace::Html,
+    pb::Namespace::Svg,
+    pb::Namespace::Mathml,
+];
+
+/// The fixture that produces each namespace, and the element in it that does.
+const fn namespace_source(namespace: pb::Namespace) -> Option<(&'static str, &'static str)> {
+    use pb::Namespace as N;
+    match namespace {
+        N::Unspecified => None,
+        N::Html => Some(("cdata_svg.html", "<p>")),
+        N::Svg => Some(("cdata_svg.html", "<svg>")),
+        N::Mathml => Some(("mathml_formula.html", "<math>")),
+    }
+}
+
+/// Every namespace is reachable from a committed fixture.
+///
+/// `convert::namespace` matches on a URI string rather than an enum, so unlike
+/// the others it cannot be exhaustive and a namespace nobody exercises would
+/// stay unnoticed. MathML is the one that was: the URI constant and its unit
+/// test existed from the first commit, and no document had ever reached them.
+#[tokio::test]
+async fn every_namespace_is_produced_by_a_fixture() {
+    assert!(
+        pb::Namespace::try_from(ALL_NAMESPACES.len() as i32).is_err(),
+        "the contract grew a namespace this list does not name"
+    );
+
+    let client = start_server().await;
+
+    for namespace in ALL_NAMESPACES {
+        let Some((fixture, element)) = namespace_source(namespace) else {
+            continue;
+        };
+        let events = extract_file(&client, fixture, everything(), 64).await;
+        let seen: Vec<i32> = only!(events, Event::Element)
+            .iter()
+            .map(|element| element.namespace)
+            .collect();
+        assert!(
+            seen.contains(&(namespace as i32)),
+            "{namespace:?} should come from {element} in {fixture}, saw {seen:?}"
+        );
+        assert!(
+            !seen.contains(&(pb::Namespace::Unspecified as i32)),
+            "{fixture} produced an unspecified namespace"
+        );
+    }
+}
+
+const ALL_SELECTOR_ERROR_CODES: [pb::SelectorErrorCode; 13] = [
+    pb::SelectorErrorCode::Unspecified,
+    pb::SelectorErrorCode::UnexpectedToken,
+    pb::SelectorErrorCode::UnexpectedEnd,
+    pb::SelectorErrorCode::MissingAttributeName,
+    pb::SelectorErrorCode::EmptySelector,
+    pb::SelectorErrorCode::DanglingCombinator,
+    pb::SelectorErrorCode::UnexpectedTokenInAttribute,
+    pb::SelectorErrorCode::UnsupportedPseudoClassOrElement,
+    pb::SelectorErrorCode::NestedNegation,
+    pb::SelectorErrorCode::NamespacedSelector,
+    pb::SelectorErrorCode::InvalidClassName,
+    pb::SelectorErrorCode::UnsupportedCombinator,
+    pb::SelectorErrorCode::UnsupportedSyntax,
+];
+
+/// A selector that triggers each code, or `None` where lol-html 3 has no path
+/// to it.
+///
+/// Two are dead upstream, and both are mirrored anyway because the match in
+/// `errors::selector_code` has to name every variant to stay exhaustive:
+///
+/// - `NESTED_NEGATION` is declared in lol-html's error enum and never
+///   constructed anywhere in its source. The input the name describes,
+///   `:not(:not(div))`, compiles cleanly, which the test below pins.
+/// - `UNSUPPORTED_SYNTAX` is reachable only from cssparser's at-rule errors,
+///   which parsing a bare selector list never raises, and from two paths
+///   lol-html marks with `debug_assert!(false)` as unreachable.
+const fn selector_triggering(code: pb::SelectorErrorCode) -> Option<&'static str> {
+    use pb::SelectorErrorCode as C;
+    match code {
+        C::Unspecified | C::NestedNegation | C::UnsupportedSyntax => None,
+        C::UnexpectedToken => Some("div@"),
+        C::UnexpectedEnd => Some("div."),
+        C::MissingAttributeName => Some(r#"div[="foo"]"#),
+        C::EmptySelector => Some(""),
+        C::DanglingCombinator => Some("div >"),
+        C::UnexpectedTokenInAttribute => Some(r#"div[foo~"bar"]"#),
+        C::UnsupportedPseudoClassOrElement => Some("li:last-child"),
+        C::NamespacedSelector => Some("svg|a"),
+        C::InvalidClassName => Some(".foo()"),
+        C::UnsupportedCombinator => Some("h1 + p"),
+    }
+}
+
+/// Every selector error code lol-html can reach has a selector that reaches it.
+#[tokio::test]
+async fn every_reachable_selector_error_code_has_a_selector_that_triggers_it() {
+    assert!(
+        pb::SelectorErrorCode::try_from(ALL_SELECTOR_ERROR_CODES.len() as i32).is_err(),
+        "the contract grew a selector error code this list does not name"
+    );
+
+    let expected: Vec<(pb::SelectorErrorCode, &str)> = ALL_SELECTOR_ERROR_CODES
+        .iter()
+        .filter_map(|code| selector_triggering(*code).map(|selector| (*code, selector)))
+        .collect();
+
+    let mut client = start_server().await;
+    let response = client
+        .validate_selectors(pb::ValidateSelectorsRequest {
+            rules: expected
+                .iter()
+                .map(|(code, selector)| rule(code.as_str_name(), selector))
+                .collect(),
+        })
+        .await
+        .expect("validate")
+        .into_inner();
+
+    // Every one of them fails, so the diagnostics line up with the rules.
+    assert_eq!(
+        response.diagnostics.len(),
+        expected.len(),
+        "every selector here is supposed to be rejected"
+    );
+    for ((code, selector), diagnostic) in expected.iter().zip(&response.diagnostics) {
+        assert_eq!(
+            diagnostic.code,
+            *code as i32,
+            "`{selector}` should be {code:?}, got {:?}",
+            pb::SelectorErrorCode::try_from(diagnostic.code)
+        );
+    }
+
+    // The one input `NESTED_NEGATION` names, which lol-html accepts.
+    let nested = client
+        .validate_selectors(pb::ValidateSelectorsRequest {
+            rules: vec![rule("nested", ":not(:not(div))")],
+        })
+        .await
+        .expect("validate")
+        .into_inner();
+    assert!(
+        nested.diagnostics.is_empty(),
+        "a nested negation compiles in lol-html 3, which is why NESTED_NEGATION is dead: {:?}",
+        nested.diagnostics
     );
 }
 

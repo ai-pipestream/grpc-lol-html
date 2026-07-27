@@ -146,7 +146,7 @@ def main() -> int:
     if not positional:
         print(
             "usage: client.py <file.html> [selector...] [--spans] [--script-text] "
-            "[--raw-text] [--allow-ambiguous] [--encoding=LABEL]",
+            "[--all-text] [--raw-text] [--allow-ambiguous] [--encoding=LABEL]",
             file=sys.stderr,
         )
         return 2
@@ -178,16 +178,28 @@ def main() -> int:
     encoding = next(
         (a[len("--encoding=") :] for a in argv if a.startswith("--encoding=")), ""
     )
-    text_types = (
-        [
+    # Empty means the server's default of prose plus titles. `--script-text`
+    # adds the two that make up most of a real page's bytes; `--all-text` adds
+    # the last two as well, which only turn up in `<plaintext>` and in CDATA
+    # sections inside foreign content.
+    if "--all-text" in flags:
+        text_types = [
+            types.TEXT_TYPE_DATA,
+            types.TEXT_TYPE_RCDATA,
+            types.TEXT_TYPE_RAW_TEXT,
+            types.TEXT_TYPE_SCRIPT_DATA,
+            types.TEXT_TYPE_PLAIN_TEXT,
+            types.TEXT_TYPE_CDATA_SECTION,
+        ]
+    elif "--script-text" in flags:
+        text_types = [
             types.TEXT_TYPE_DATA,
             types.TEXT_TYPE_RCDATA,
             types.TEXT_TYPE_SCRIPT_DATA,
             types.TEXT_TYPE_RAW_TEXT,
         ]
-        if "--script-text" in flags
-        else []
-    )
+    else:
+        text_types = []
 
     options = svc.ExtractOptions(
         rules=rules,

@@ -53,7 +53,8 @@ public final class LolHtmlDemo {
 
         if (positional.isEmpty()) {
             System.err.println("usage: LolHtmlDemo <file.html> [selector...] [--spans] "
-                    + "[--script-text] [--raw-text] [--allow-ambiguous] [--encoding=LABEL]");
+                    + "[--script-text] [--all-text] [--raw-text] [--allow-ambiguous] "
+                    + "[--encoding=LABEL]");
             System.exit(2);
         }
 
@@ -93,7 +94,19 @@ public final class LolHtmlDemo {
                 .setAdjustCharsetOnMetaTag(true)
                 .setAllowAmbiguousMarkup(flags.contains("--allow-ambiguous"))
                 .setRawTextChunks(flags.contains("--raw-text"));
-        if (flags.contains("--script-text")) {
+        // No text types means the server's default of prose plus titles.
+        // `--script-text` adds the two that make up most of a real page's
+        // bytes; `--all-text` adds the last two as well, which only turn up in
+        // `<plaintext>` and in CDATA sections inside foreign content.
+        if (flags.contains("--all-text")) {
+            options.addAllTextTypes(List.of(
+                    TextType.TEXT_TYPE_DATA,
+                    TextType.TEXT_TYPE_RCDATA,
+                    TextType.TEXT_TYPE_RAW_TEXT,
+                    TextType.TEXT_TYPE_SCRIPT_DATA,
+                    TextType.TEXT_TYPE_PLAIN_TEXT,
+                    TextType.TEXT_TYPE_CDATA_SECTION));
+        } else if (flags.contains("--script-text")) {
             options.addAllTextTypes(List.of(
                     TextType.TEXT_TYPE_DATA,
                     TextType.TEXT_TYPE_RCDATA,

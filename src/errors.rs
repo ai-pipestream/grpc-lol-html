@@ -21,8 +21,19 @@ use crate::proto::v1 as pb;
 /// Translate a selector compilation failure into its wire code, plus the
 /// offending character for the one variant that names one.
 ///
-/// `EmptyNegation` is deprecated and unreachable in lol-html 3, but naming it
-/// is what keeps this match exhaustive, which is the whole point.
+/// Three of these are dead in lol-html 3, and are mirrored anyway because the
+/// match has to name every variant to stay exhaustive:
+///
+/// - `EmptyNegation` is deprecated and never constructed.
+/// - `NestedNegation` is declared and never constructed either. The input its
+///   name describes, `:not(:not(div))`, compiles cleanly.
+/// - `UnsupportedSyntax` is reachable only from cssparser's at-rule errors,
+///   which parsing a bare selector list never raises, and from two paths
+///   lol-html itself marks with `debug_assert!(false)`.
+///
+/// `every_reachable_selector_error_code_has_a_selector_that_triggers_it` in
+/// `tests/extract.rs` carries a selector for each of the other ten, so which
+/// are live is recorded rather than remembered.
 #[allow(deprecated)]
 pub fn selector_code(err: &SelectorError) -> (pb::SelectorErrorCode, String) {
     use pb::SelectorErrorCode as Code;

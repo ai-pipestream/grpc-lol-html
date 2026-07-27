@@ -37,6 +37,10 @@ means, and divergence is evidence one of them is guessing.
 ./compare-clients.sh cdata_svg.html
 ```
 
+The sweep reads the fixture directory rather than a list inside the script, so
+a fixture added for a Rust test is compared without anyone remembering to say
+so. The two it does not compare are named in the script with the reason.
+
 ## The output format
 
 One line per event, terse and field-ordered so the three can be diffed:
@@ -58,8 +62,9 @@ the sort of thing that quietly poisons a link extractor built on tag names
 alone.
 
 Common flags: `--spans` (byte ranges), `--script-text` (also report `<script>`
-and `<style>` contents), `--raw-text` (unreassembled text fragments),
-`--allow-ambiguous`, `--encoding=LABEL`.
+and `<style>` contents), `--all-text` (every text type, including the two that
+only turn up in `<plaintext>` and in CDATA sections), `--raw-text`
+(unreassembled text fragments), `--allow-ambiguous`, `--encoding=LABEL`.
 
 ## Things that bite
 
@@ -142,11 +147,18 @@ them at six different chunk sizes and compare the streams in full.
 | `charset_meta_windows1251.html` | `<meta charset>` overriding the declared encoding |
 | `utf16.html` | an encoding lol-html cannot tokenize at all |
 | `cdata_svg.html` | SVG namespace, CDATA text, and an `<a>` in each namespace |
+| `mathml_formula.html` | the third namespace, the one no other fixture reaches |
+| `plaintext_tail.html` | `<plaintext>`, after which the tokenizer never returns |
 | `doctype_legacy.html` | a doctype carrying public and system identifiers |
 | `unclosed_tags.html` | elements that never close, so no end-tag events |
 | `duplicate_and_bare_attrs.html` | attribute case, bare attributes, and their spans |
 | `json_ld_product.html` | structured data in a `<script type="application/ld+json">` |
 | `spa_shell.html` | a page whose content does not exist until JavaScript runs |
+
+Between them they reach **every variant of every enum in the contract**: all six
+`TextType`s, all three `Namespace`s and all six `Capture`s. That is a test
+rather than a claim, and `tests/extract.rs` names the fixture responsible for
+each one, so a variant nobody exercises cannot hide.
 
 These are all tiny, because each one exists to pin a single hazard. For
 something that looks like real work, see
