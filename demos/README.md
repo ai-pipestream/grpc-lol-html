@@ -106,6 +106,12 @@ them at six different chunk sizes and compare the streams in full.
 | `unclosed_tags.html` | elements that never close, so no end-tag events |
 | `duplicate_and_bare_attrs.html` | attribute case, bare attributes, and their spans |
 
+These are all tiny, because each one exists to pin a single hazard. For
+something that looks like real work, see
+[`sample-data/large/`](sample-data/large): drop in a page worth megabytes and
+it shows up in the viewer's dropdown and can be handed to the bench with
+`--file`.
+
 Try the ones that fail on purpose:
 
 ```bash

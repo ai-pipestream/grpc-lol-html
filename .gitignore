@@ -49,3 +49,8 @@ Thumbs.db
 
 # Bench is its own crate with its own build output.
 bench/target
+
+# Real pages worth megabytes, for the web viewer and the bench. The documents
+# are not committed; the README explaining where to get them is, so the glob is
+# on the payload rather than on the directory.
+demos/sample-data/large/*.html

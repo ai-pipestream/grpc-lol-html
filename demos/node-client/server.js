@@ -18,7 +18,7 @@
 // Environment: LOL_HTML_ADDR (default 127.0.0.1:50051), PORT (default 8080).
 
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { LolHtmlClient } from "./lib/lolhtml.js";
@@ -44,6 +44,35 @@ const MAX_DELAY_MS = 2000;
 const DEFAULT_CHUNK_BYTES = 256;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Where the fixtures live. Resolved once, and used to bound path lookups. */
+const sampleDir = path.resolve(publicDir, "..", "..", "sample-data");
+
+/**
+ * The fixtures, with their sizes, plus anything dropped in `sample-data/large`.
+ *
+ * `large/` is gitignored and meant for real pages worth megabytes, which do
+ * not belong in the repository but are the only way to see this service do
+ * something a small fixture cannot show.
+ */
+async function listSamples() {
+  const found = [];
+  for (const dir of ["", "large"]) {
+    const full = path.join(sampleDir, dir);
+    let entries;
+    try {
+      entries = await readdir(full);
+    } catch {
+      continue; // `large/` is optional.
+    }
+    for (const entry of entries.filter((e) => e.endsWith(".html")).sort()) {
+      const name = dir ? `${dir}/${entry}` : entry;
+      const { size } = await stat(path.join(full, entry));
+      found.push({ name, size });
+    }
+  }
+  return found;
+}
 
 function sendJson(res, status, body) {
   res.writeHead(status, { "content-type": "application/json" });
@@ -187,16 +216,24 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/samples") {
-      const dir = path.join(publicDir, "..", "..", "sample-data");
-      const { readdir } = await import("node:fs/promises");
-      const files = (await readdir(dir)).filter((f) => f.endsWith(".html")).sort();
-      return sendJson(res, 200, { files });
+      return sendJson(res, 200, { files: await listSamples() });
     }
 
-    const sample = url.pathname.match(/^\/api\/samples\/([\w.-]+)$/);
+    // A name may contain one `large/` segment, so the path is resolved and
+    // then checked to be inside the sample directory rather than pattern
+    // matched. Prefix checks on unresolved strings are how directory
+    // traversal gets through.
+    const sample = url.pathname.match(/^\/api\/samples\/(.+)$/);
     if (req.method === "GET" && sample) {
-      const file = path.join(publicDir, "..", "..", "sample-data", sample[1]);
-      res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+      const file = path.resolve(sampleDir, decodeURIComponent(sample[1]));
+      if (!file.startsWith(sampleDir + path.sep)) {
+        return sendJson(res, 403, { error: "outside the sample directory" });
+      }
+      const { size } = await stat(file);
+      res.writeHead(200, {
+        "content-type": "text/plain; charset=utf-8",
+        "content-length": size,
+      });
       return res.end(await readFile(file));
     }
 

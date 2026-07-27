@@ -55,6 +55,27 @@ Worth trying:
 | `script_and_style_text.html` | no JavaScript in the text feed, because it is not prose |
 | `deep_nesting.html` | 22 KiB and 2000 levels deep, where the throttle stops mattering |
 
+### A real page
+
+The small fixtures each pin one hazard; none of them show what the service is
+actually for. Drop any HTML worth megabytes into
+[`../sample-data/large/`](../sample-data/large) and it appears in the dropdown,
+or use the file picker for something on your disk. The one in the docs is the
+WHATWG HTML spec:
+
+```bash
+curl -sL --compressed -o ../sample-data/large/html-spec.html https://html.spec.whatwg.org/
+```
+
+14.8 MiB, and with `a[href], h2, code, dfn` it produces **415,212 events and
+107,228 matches** in about three seconds of browser time, first match at 29%
+uploaded. The feed holds 600 rows however many events arrive.
+
+The throughput the page reports is browser time: throttle, SSE bridge, JSON
+parsing and rendering all included. It is roughly an order of magnitude below
+what the service does on its own, which is what [`../../bench`](../../bench)
+measures.
+
 ### Why SSE is parsed by hand
 
 `EventSource` only does `GET`, and the whole point is that the upload and the

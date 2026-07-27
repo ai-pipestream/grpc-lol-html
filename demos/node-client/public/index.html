@@ -110,6 +110,10 @@
       <select id="sample"></select>
     </div>
     <div>
+      <label for="pick">…or a local file</label>
+      <input id="pick" type="file" accept=".html,.htm,text/html">
+    </div>
+    <div>
       <label for="selectors">Selectors, comma separated</label>
       <input id="selectors" type="text" value="a[href], h1, h2, p">
     </div>
@@ -166,31 +170,77 @@
 const $ = (id) => document.getElementById(id);
 const feed = $("feed");
 
-// Keep the DOM bounded: a large page can emit tens of thousands of events and
-// the browser is not the thing this demo is trying to stress.
+/// Keep the DOM bounded. The HTML spec produces over 400,000 events and the
+/// browser is not the thing this demo is trying to stress.
 const MAX_ROWS = 600;
 
 let sizeBytes = 0;
 
 const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 const clip = (s, n = 90) => (s.length > n ? s.slice(0, n) + "…" : s);
-const kb = (n) => (n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KiB`);
+const num = (n) => n.toLocaleString("en-US");
+const kb = (n) =>
+  n < 1024 ? `${n} B`
+  : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KiB`
+  : `${(n / 1024 / 1024).toFixed(1)} MiB`;
 
 async function loadSamples() {
   const { files } = await (await fetch("/api/samples")).json();
-  $("sample").innerHTML = files.map((f) => `<option>${esc(f)}</option>`).join("");
-  if (files.includes("cdata_svg.html")) $("sample").value = "cdata_svg.html";
+  $("sample").innerHTML = files
+    .map((f) => `<option value="${esc(f.name)}">${esc(f.name)} (${kb(f.size)})</option>`)
+    .join("");
+  if (files.some((f) => f.name === "cdata_svg.html")) $("sample").value = "cdata_svg.html";
 }
 
+// A locally picked file wins over the dropdown, so changing the dropdown
+// clears the picker and the two cannot disagree silently.
+$("sample").addEventListener("change", () => { $("pick").value = ""; });
 $("delay").addEventListener("input", (e) => {
   $("delayLabel").textContent = `${e.target.value} ms / chunk`;
 });
 
+// ---------------------------------------------------------------------------
+// Rendering, batched
+// ---------------------------------------------------------------------------
+//
+// Rows are queued and written on an animation frame rather than as they
+// arrive. One append plus a scrollTop read per event forces a layout per
+// event, which at 400,000 events makes the browser the bottleneck and hides
+// the thing being demonstrated. Only the tail of a batch can ever be visible,
+// so the rest is dropped without touching the DOM at all.
+
+let pending = [];
+let scheduled = false;
+let onFlush = null;
+
+function schedule() {
+  if (!scheduled) {
+    scheduled = true;
+    requestAnimationFrame(flush);
+  }
+}
+
 function row(html) {
-  const div = document.createElement("div");
-  div.className = "ev new";
-  div.innerHTML = html;
-  feed.append(div);
+  pending.push(html);
+  schedule();
+}
+
+function flush() {
+  scheduled = false;
+  if (onFlush) onFlush();
+  if (pending.length === 0) return;
+
+  const tail = pending.slice(-MAX_ROWS);
+  pending = [];
+
+  const batch = document.createDocumentFragment();
+  for (const html of tail) {
+    const div = document.createElement("div");
+    div.className = "ev new";
+    div.innerHTML = html;
+    batch.append(div);
+  }
+  feed.append(batch);
   while (feed.childElementCount > MAX_ROWS) feed.firstElementChild.remove();
   feed.scrollTop = feed.scrollHeight;
 }
@@ -201,12 +251,12 @@ function render(kind, d) {
     case "started":
       return `<span class="k">started</span> encoding=<b>${esc(d.encoding)}</b> rules=${d.ruleCount}`;
     case "element": {
-      const svg = d.namespace && d.namespace !== "NAMESPACE_HTML";
-      const ns = svg ? ` <span class="k">${esc(d.namespace.replace("NAMESPACE_", ""))}</span>` : "";
+      const foreign = d.namespace && d.namespace !== "NAMESPACE_HTML";
+      const ns = foreign ? ` <span class="k">${esc(d.namespace.replace("NAMESPACE_", ""))}</span>` : "";
       const attrs = (d.attributes ?? [])
         .map((a) => ` <span class="attr">${esc(a.name)}="${esc(clip(a.value, 40))}"</span>`)
         .join("");
-      return `<span class="tag${svg ? " svg" : ""}">&lt;${esc(d.tagName)}&gt;</span>${attrs}${ns}`
+      return `<span class="tag${foreign ? " svg" : ""}">&lt;${esc(d.tagName)}&gt;</span>${attrs}${ns}`
         + ` <span class="rule">${esc(d.ruleId)}</span>`;
     }
     case "text":
@@ -220,21 +270,26 @@ function render(kind, d) {
     case "endTag":
       return null; // structurally interesting, visually noise
     case "finished":
-      return `<span class="k">finished</span> ${d.bytesParsed} bytes`
+      return `<span class="k">finished</span> ${num(d.bytesParsed)} bytes`
         + (d.bailedOut ? ` <span class="err">bailed out: ${esc(d.bailOutReason)}</span>` : "");
     case "error":
       return `<span class="err">${esc(d.code)}</span> ${esc(clip(d.message, 160))}`;
     case "grpc-error":
       return `<span class="err">rpc failed</span> ${esc(d.message)}`;
     default:
-      return null;
+      return null; // an arm this page has no name for; the contract says ignore it
   }
 }
+
+// ---------------------------------------------------------------------------
+// The run
+// ---------------------------------------------------------------------------
 
 async function run() {
   const button = $("run");
   button.disabled = true;
   feed.innerHTML = "";
+  pending = [];
   $("counts").innerHTML = "";
   $("mark").style.display = "none";
   $("fill").style.width = "0";
@@ -243,8 +298,22 @@ async function run() {
   for (const id of ["sEvents", "sMatches", "sText", "sMs"]) $(id).textContent = "0";
   $("sEnc").textContent = "–";
 
-  const file = $("sample").value;
-  const body = await (await fetch(`/api/samples/${file}`)).arrayBuffer();
+  try {
+    await stream();
+  } catch (err) {
+    row(`<span class="err">page error</span> ${esc(String(err))}`);
+    flush();
+  } finally {
+    onFlush = null;
+    button.disabled = false;
+  }
+}
+
+async function stream() {
+  const picked = $("pick").files[0];
+  const body = picked
+    ? await picked.arrayBuffer()
+    : await (await fetch(`/api/samples/${$("sample").value}`)).arrayBuffer();
   sizeBytes = body.byteLength;
   $("sizeLabel").textContent = kb(sizeBytes);
 
@@ -255,31 +324,45 @@ async function run() {
   params.set("delayMs", $("delay").value);
 
   // Aim for roughly 40 upload steps whatever the document size, so a 300 byte
-  // fixture and a 300 KiB page both show the same thing. Chunk size changes
+  // fixture and a 15 MiB spec both show the same thing. Chunk size changes
   // nothing about the events, only how finely you get to watch them arrive.
-  const chunkBytes = Math.min(65536, Math.max(16, Math.ceil(sizeBytes / 40)));
+  const chunkBytes = Math.min(1 << 20, Math.max(16, Math.ceil(sizeBytes / 40)));
   params.set("chunkBytes", chunkBytes);
-  $("chunkLabel").textContent = `${chunkBytes} B chunks`;
+  $("chunkLabel").textContent = `${kb(chunkBytes)} chunks`;
 
   const started = performance.now();
   let events = 0, matches = 0, texts = 0, fed = 0, firstMatchAt = null;
   const counts = new Map();
+
+  // Counters are read on the animation frame, never written per event.
+  onFlush = () => {
+    $("sEvents").textContent = num(events);
+    $("sMatches").textContent = num(matches);
+    $("sText").textContent = num(texts);
+    $("counts").innerHTML = [...counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([id, n]) => `<tr><td>${esc(clip(id, 22))}</td><td class="n">${num(n)}</td></tr>`)
+      .join("");
+  };
 
   const res = await fetch(`/api/extract?${params}`, { method: "POST", body });
   if (!res.ok) {
     const problem = await res.json();
     row(`<span class="err">${esc(problem.error)}</span> `
       + esc((problem.diagnostics ?? []).map((d) => `${d.ruleId}: ${d.message}`).join("; ")));
-    button.disabled = false;
+    flush();
     return;
   }
 
-  // SSE over a POST response, so it has to be parsed by hand: EventSource
-  // only does GET, and the whole point here is that the upload and the event
-  // stream are one request.
+  // SSE over a POST response, so it is parsed by hand: EventSource only does
+  // GET, and the whole point is that the upload and the event stream are one
+  // request. Frames are split on offsets rather than by slicing the buffer or
+  // running a regex per frame, both of which are fine at 300 events and are
+  // not fine at 400,000.
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let at = 0;
 
   for (;;) {
     const { value, done } = await reader.read();
@@ -287,13 +370,16 @@ async function run() {
     buffer += decoder.decode(value, { stream: true });
 
     let split;
-    while ((split = buffer.indexOf("\n\n")) !== -1) {
-      const raw = buffer.slice(0, split);
-      buffer = buffer.slice(split + 2);
+    while ((split = buffer.indexOf("\n\n", at)) !== -1) {
+      const raw = buffer.slice(at, split);
+      at = split + 2;
 
-      const kind = raw.match(/^event: (.*)$/m)?.[1];
-      const data = JSON.parse(raw.match(/^data: (.*)$/m)?.[1] ?? "{}");
-      if (!kind) continue;
+      const nl = raw.indexOf("\n");
+      if (nl < 0 || !raw.startsWith("event: ")) continue;
+      const kind = raw.slice(7, nl);
+      const rest = raw.slice(nl + 1);
+      if (!rest.startsWith("data: ")) continue;
+      const data = JSON.parse(rest.slice(6));
 
       if (kind === "fed") {
         fed = data.bytes;
@@ -305,39 +391,65 @@ async function run() {
 
       events++;
       if (kind === "started") $("sEnc").textContent = data.encoding;
+      if (kind === "text" && data.text.trim()) texts++;
       if (kind === "element") {
         matches++;
         counts.set(data.ruleId, (counts.get(data.ruleId) ?? 0) + 1);
-        if (firstMatchAt === null) {
-          firstMatchAt = fed;
-          const pct = (fed / sizeBytes) * 100;
-          $("mark").style.left = `${pct}%`;
-          $("mark").style.display = "block";
-          $("sMs").textContent = Math.round(performance.now() - started);
-          $("verdict").className = "verdict";
-          $("verdict").innerHTML = `First match after <strong>${kb(fed)} of ${kb(sizeBytes)}</strong>`
-            + ` (${pct.toFixed(0)}% uploaded). The rest of the document had not been sent yet.`;
-        }
+        if (firstMatchAt === null) firstMatchAt = markFirstMatch(fed, started);
       }
-      if (kind === "text" && data.text.trim()) texts++;
 
-      const html = render(kind, data);
-      if (html) row(html);
+      // Only the last MAX_ROWS of a batch can ever be seen, so once that many
+      // are queued there is no reason to format any more of them.
+      if (pending.length < MAX_ROWS) {
+        const html = render(kind, data);
+        if (html) row(html);
+      } else {
+        schedule();
+      }
+    }
 
-      $("sEvents").textContent = events;
-      $("sMatches").textContent = matches;
-      $("sText").textContent = texts;
-      $("counts").innerHTML = [...counts.entries()]
-        .map(([id, n]) => `<tr><td>${esc(clip(id, 22))}</td><td class="n">${n}</td></tr>`)
-        .join("");
+    // Compact once per read rather than once per frame. Re-slicing the whole
+    // buffer for every frame is quadratic, and a big page delivers thousands
+    // of frames per read.
+    if (at > 0) {
+      buffer = buffer.slice(at);
+      at = 0;
     }
   }
 
+  flush();
+  finish(events, firstMatchAt, performance.now() - started);
+}
+
+/** Place the marker and say how far in the first match landed. */
+function markFirstMatch(fed, started) {
+  const pct = (fed / sizeBytes) * 100;
+  $("mark").style.left = `${pct}%`;
+  $("mark").style.display = "block";
+  $("sMs").textContent = Math.round(performance.now() - started);
+  $("verdict").className = "verdict";
+  $("verdict").innerHTML = `First match after <strong>${kb(fed)} of ${kb(sizeBytes)}</strong>`
+    + ` (${pct.toFixed(0)}% uploaded). The rest of the document had not been sent yet.`;
+  return fed;
+}
+
+function finish(events, firstMatchAt, wallMs) {
   if (firstMatchAt === null) {
     $("verdict").className = "verdict idle";
     $("verdict").textContent = "No element matched. Try a different selector.";
+    return;
   }
-  button.disabled = false;
+  const mib = sizeBytes / 1024 / 1024;
+  const rate = mib / (wallMs / 1000);
+  // Deliberately not labelled as the service's throughput. This is the browser
+  // clock, so it includes the throttle, the SSE bridge, JSON parsing and
+  // rendering. `bench/` measures the service alone and gets roughly an order
+  // of magnitude more.
+  $("verdict").innerHTML +=
+    `<br><span class="hint">${num(events)} events, ${kb(sizeBytes)} in `
+    + `${Math.round(wallMs)} ms of browser time (${rate.toFixed(0)} MiB/s including `
+    + `the throttle, this page and the SSE bridge, so not the service's own `
+    + `speed: see <code>bench/</code>).</span>`;
 }
 
 $("run").addEventListener("click", run);
