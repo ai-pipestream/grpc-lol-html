@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+    }
+}
+
+// Standalone on purpose. This is a demo to be copied, not a module of
+// anything, and it has no parent build to be included by.
+rootProject.name = 'lolhtml-java-demo'

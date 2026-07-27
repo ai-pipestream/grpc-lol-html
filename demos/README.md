@@ -19,7 +19,7 @@ cargo run --release
 |---|---|---|
 | [`node-client`](node-client) | Node 20+, `@grpc/grpc-js` | CLI: `npm install && node cli.js ../sample-data/cdata_svg.html "a[href]"` <br> **Web viewer: `npm start`, then http://127.0.0.1:8080** |
 | [`python-client`](python-client) | Python 3.11+, `grpcio` | `./run.sh ../sample-data/cdata_svg.html "a[href]"` |
-| [`java-client`](java-client) | Java 17+, Maven, `grpc-java` | `mvn -q compile exec:java -Dexec.args="../sample-data/cdata_svg.html a[href]"` |
+| [`java-client`](java-client) | Java 17+, Gradle, `grpc-java` | `./gradlew -q run --args="../sample-data/cdata_svg.html a[href]"` |
 
 **Start with the web viewer.** It is the one that shows what this service is
 for: matches drawn on the page while the upload bar is still filling, with a

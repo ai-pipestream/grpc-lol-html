@@ -27,11 +27,13 @@ declare -A ARGS=(
   [charset_meta_windows1251.html]="* --encoding=windows-1251"
   [duplicate_and_bare_attrs.html]="* --spans"
   # `script[type='application/ld+json']` is the selector you would actually
-  # write, and it cannot be compared: Maven flattens `-Dexec.args` into one
-  # string and strips the quotes, so Java alone receives
-  # `script[type=application/ld+json]`, which is not valid CSS. Any selector
-  # with a quoted attribute value has the same problem. `$=` says the same
-  # thing here without them.
+  # write, and it cannot be compared. Java is reached through a build tool that
+  # takes the whole argument list as one string and re-splits it, and the split
+  # eats the quotes, so Java alone receives `script[type=application/ld+json]`,
+  # which is not valid CSS. Gradle behaves exactly as Maven did here, so this
+  # is a property of passing arguments through a build tool rather than a quirk
+  # of either one. Any quoted attribute value has the problem; `$=` says the
+  # same thing without quotes.
   [json_ld_product.html]="script[type\$=json] --script-text"
   [plaintext_tail.html]="* --all-text"
   [script_and_style_text.html]="* --script-text"
@@ -44,7 +46,7 @@ declare -A ARGS=(
 # decision somebody made rather than one that happened.
 declare -A SKIP=(
   [utf16.html]="rejected before any events, so all three print nothing and agree vacuously"
-  [deep_nesting.html]="2000 nested divs, minutes of Maven startup for no additional coverage"
+  [deep_nesting.html]="2000 nested divs, minutes of JVM startup for no additional coverage"
 )
 
 # The sweep is the directory, not a hand-kept list. A fixture added for a Rust
@@ -70,11 +72,13 @@ fi
 TMP="${TMPDIR:-/tmp}"
 failures=0
 
-# Build the Java client once, up front. `exec:java` runs whatever is in
-# target/classes and does not compile first, so without this the comparison
-# will happily run a stale client and report agreement about code that is no
-# longer there.
-( cd java-client && mvn -q compile ) || { echo "the Java client did not build"; exit 1; }
+# Build the Java client once, up front. `gradle run` compiles first, so this is
+# no longer load-bearing the way it was under Maven, where `exec:java` ran
+# whatever happened to be in target/classes and would compare a stale client
+# against fresh Node and Python ones. It stays because a compile error should
+# be reported once here rather than twelve times below.
+( cd java-client && ./gradlew --console=plain -q classes ) \
+  || { echo "the Java client did not build"; exit 1; }
 
 for fixture in "${fixtures[@]}"; do
   read -r -a args <<< "${ARGS[$fixture]:-*}"
@@ -85,11 +89,12 @@ for fixture in "${fixtures[@]}"; do
   ( cd python-client && ./run.sh "../sample-data/$fixture" "${args[@]}" ) \
       > "$TMP/lolhtml-python.txt" 2>/dev/null
 
-  # exec.args is one string, so the argument list has to be flattened. Paths
-  # are resolved from java-client/, hence the extra `../`.
-  ( cd java-client && mvn -q exec:java \
-      -Dexec.args="../sample-data/$fixture ${args[*]}" 2>/dev/null ) \
-      | grep -v '^WARNING' > "$TMP/lolhtml-java.txt"
+  # --args is one string, so the argument list has to be flattened. Paths are
+  # resolved from java-client/, hence the extra `../`. The JVM's own warnings
+  # about sun.misc.Unsafe go to stderr, which is already discarded.
+  ( cd java-client && ./gradlew --console=plain -q run \
+      --args="../sample-data/$fixture ${args[*]}" 2>/dev/null ) \
+      > "$TMP/lolhtml-java.txt"
 
   if diff -q "$TMP/lolhtml-node.txt" "$TMP/lolhtml-python.txt" >/dev/null \
      && diff -q "$TMP/lolhtml-node.txt" "$TMP/lolhtml-java.txt" >/dev/null; then

@@ -33,8 +33,12 @@ demos/node-client/node_modules/
 demos/python-client/.venv/
 demos/python-client/gen/
 __pycache__/
-# Java: Maven output (includes protoc-generated sources).
-demos/java-client/target/
+# Java: Gradle output (includes protoc-generated sources) and its local caches.
+# Scoped to the demo rather than a bare `build`, which would match anything.
+# gradle/wrapper/ is committed on purpose: it is what makes `./gradlew` work
+# for someone who has no Gradle installed.
+demos/java-client/build/
+demos/java-client/.gradle/
 
 # --- OS / editor cruft ---
 .DS_Store
