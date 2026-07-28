@@ -58,3 +58,7 @@ bench/target
 # are not committed; the README explaining where to get them is, so the glob is
 # on the payload rather than on the directory.
 demos/sample-data/large/*.html
+
+# --- service.sh runtime state ---
+run/
+logs/
