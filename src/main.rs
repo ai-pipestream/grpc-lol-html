@@ -27,6 +27,18 @@ use grpc_lol_html::LolHtmlGrpc;
 /// Default listen address when `GRPC_LOL_HTML_ADDR` is not set.
 const DEFAULT_ADDR: &str = "0.0.0.0:50051";
 
+/// Serialized `FileDescriptorSet` for `proto/lolhtml/v1`, backing gRPC server
+/// reflection.
+///
+/// Codegen here runs through `buf generate`, not a build.rs, so there is no
+/// build-time descriptor set to reuse; this is the same `buf build` output
+/// checked in next to the generated Rust. Regenerate after any proto change:
+///
+/// ```sh
+/// buf build -o src/gen/file_descriptor_set.binpb
+/// ```
+const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!("gen/file_descriptor_set.binpb");
+
 /// Default HTTP/2 initial window, for both the stream and the connection.
 ///
 /// hyper defaults to 1 MiB. Documents here are pages rather than the hundreds
@@ -76,6 +88,12 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     ))
     .unwrap_or(DEFAULT_WINDOW_BYTES);
 
+    // Reflection (v1) so clients like grpcurl can discover the contract from a
+    // live server instead of shipping the .proto files around.
+    let reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+        .build_v1()?;
+
     eprintln!("grpc-lol-html listening on {addr} (http2 window {window} bytes)");
     Server::builder()
         .tcp_nodelay(true)
@@ -86,6 +104,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .initial_connection_window_size(window)
         .max_concurrent_streams(1024)
         .add_service(service)
+        .add_service(reflection)
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
     eprintln!("grpc-lol-html shut down");

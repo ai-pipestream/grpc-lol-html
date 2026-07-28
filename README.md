@@ -239,8 +239,15 @@ cargo test                                              # 39 tests
 cargo clippy --all-targets --all-features -- -Dwarnings
 buf lint && buf build
 buf generate                                            # regenerate src/gen
+buf build -o src/gen/file_descriptor_set.binpb          # regenerate the reflection descriptor set
 demos/compare-clients.sh                                # needs a running server
 ```
+
+The server also exposes gRPC reflection (v1) from a `FileDescriptorSet`
+checked in at `src/gen/file_descriptor_set.binpb` — the same `buf build`
+output, kept next to the generated Rust since codegen runs through buf rather
+than a build.rs. Rebuild it after any proto change; with it, clients such as
+`grpcurl -plaintext localhost:50051 list` need no local .proto files.
 
 MSRV is 1.88, set by tonic 0.14 rather than by lol-html, which builds on 1.85.
 
