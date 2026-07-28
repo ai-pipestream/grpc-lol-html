@@ -90,10 +90,24 @@ pub fn attribute(attr: &Attribute<'_>, want_spans: bool) -> pb::Attribute {
     pb::Attribute {
         name: attr.name(),
         name_raw: attr.name_preserve_case(),
-        value: attr.value(),
+        value: unescape_attribute_value(attr.value()),
         name_span,
         value_span,
     }
+}
+
+/// Entity-decode an attribute value, honouring the wire contract.
+///
+/// lol-html hands attribute values back exactly as written, so the decode
+/// the proto promises has to happen here. Attribute context differs from
+/// text context in the spec: a legacy semicolon-less reference followed by
+/// `=` or an alphanumeric (`?a=1&amp=2`) stays literal, which is why this
+/// is `unescape_attribute` and not `unescape`.
+fn unescape_attribute_value(value: String) -> String {
+    if !value.contains('&') {
+        return value;
+    }
+    htmlize::unescape_attribute(value.as_str()).into_owned()
 }
 
 /// Resolve an attribute's spans, discarding the pair when it is incoherent.

@@ -17,14 +17,17 @@ exclude = ["bench", "demos"]
 
 [dependencies]
 encoding_rs = "0.8.35" # Charset label lookup, the same version lol-html uses.
+htmlize = { version = "1", features = ["unescape"] }
 lol_html = "3.0.0"
 prost = "0.14.4"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 tonic = { version = "0.14.6", features = ["gzip", "zstd"] }
 tonic-prost = "0.14.6"
+tonic-reflection = "0.14.6"
 
 [dev-dependencies]
+htmlize = { version = "1", features = ["unescape"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
 
 [lints.rust]

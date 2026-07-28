@@ -1,0 +1,13 @@
+<!doctype html>
+<!-- Character references in every context the contract distinguishes:
+     DATA prose, RCDATA title, attribute values (including the legacy
+     semicolon-less form that must NOT decode there), and script text
+     (which must never decode). -->
+<html>
+<head><title>Baughman &amp; Datron</title></head>
+<body>
+<p id="case">Byrd &amp; Davis, &#8220;curly&#8221; quotes, &lt;escaped tag&gt;, caf&eacute;.</p>
+<p id="legacy"><a href="x?a=1&amp=2&amp;b=3" title="A &amp; B">link &amp; text</a></p>
+<script>if (a &amp;&amp; b) { run(); }</script>
+</body>
+</html>

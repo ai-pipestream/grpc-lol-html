@@ -39,6 +39,7 @@ const FIXTURES: &[(&str, &str)] = &[
     ("deep_nesting.html", ""),
     ("doctype_legacy.html", ""),
     ("duplicate_and_bare_attrs.html", ""),
+    ("entities.html", ""),
     ("json_ld_product.html", ""),
     ("mathml_formula.html", ""),
     ("plaintext_tail.html", ""),
@@ -361,6 +362,139 @@ async fn raw_text_chunks_reassemble_into_the_default_output() {
         pieces.last().unwrap().last_in_node,
         "the final fragment must be marked, or reassembly has no boundary"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Hazard: lol-html hands text and attributes back exactly as written, so the
+// entity decode the contract promises is the server's job
+// ---------------------------------------------------------------------------
+
+/// DATA and RCDATA text arrives entity decoded. The 7-byte chunk size splits
+/// `&amp;` across fragments, so this also pins that decoding happens after
+/// reassembly rather than per fragment.
+#[tokio::test]
+async fn entities_are_decoded_in_data_and_rcdata_text() {
+    let client = start_server().await;
+    let options = pb::ExtractOptions {
+        rules: vec![
+            pb::ExtractRule {
+                id: "case".to_owned(),
+                selector: "p#case".to_owned(),
+                captures: vec![pb::Capture::Text as i32],
+            },
+            pb::ExtractRule {
+                id: "title".to_owned(),
+                selector: "title".to_owned(),
+                captures: vec![pb::Capture::Text as i32],
+            },
+        ],
+        ..Default::default()
+    };
+
+    let events = extract_file(&client, "entities.html", options, 7).await;
+    let texts = only!(events, Event::Text);
+
+    let case = texts
+        .iter()
+        .find(|t| t.rule_id == "case")
+        .expect("p#case text");
+    assert_eq!(case.text, "Byrd & Davis, “curly” quotes, <escaped tag>, café.");
+
+    let title = texts
+        .iter()
+        .find(|t| t.rule_id == "title")
+        .expect("title text");
+    assert_eq!(title.text, "Baughman & Datron");
+}
+
+/// Script text is never entity decoded: `&amp;&amp;` inside a script means
+/// those ten characters, not `&&`.
+#[tokio::test]
+async fn script_text_is_not_entity_decoded() {
+    let client = start_server().await;
+    let options = pb::ExtractOptions {
+        rules: vec![pb::ExtractRule {
+            id: "js".to_owned(),
+            selector: "script".to_owned(),
+            captures: vec![pb::Capture::Text as i32],
+        }],
+        text_types: vec![pb::TextType::ScriptData as i32],
+        ..Default::default()
+    };
+
+    let events = extract_file(&client, "entities.html", options, 7).await;
+    let texts = only!(events, Event::Text);
+    assert_eq!(texts.len(), 1);
+    assert_eq!(texts[0].text, "if (a &amp;&amp; b) { run(); }");
+}
+
+/// Attribute values decode with attribute-context rules: `&amp;` becomes
+/// `&`, but the legacy semicolon-less `&amp=` stays literal because the
+/// spec keeps `?a=1&amp=2`-style query strings intact.
+#[tokio::test]
+async fn attribute_values_are_entity_decoded() {
+    let client = start_server().await;
+    let options = pb::ExtractOptions {
+        rules: vec![pb::ExtractRule {
+            id: "a".to_owned(),
+            selector: "a".to_owned(),
+            captures: vec![pb::Capture::Attributes as i32],
+        }],
+        ..Default::default()
+    };
+
+    let events = extract_file(&client, "entities.html", options, 7).await;
+    let elements = only!(events, Event::Element);
+    assert_eq!(elements.len(), 1);
+
+    let value = |name: &str| {
+        elements[0]
+            .attributes
+            .iter()
+            .find(|a| a.name == name)
+            .unwrap_or_else(|| panic!("attribute {name}"))
+            .value
+            .clone()
+    };
+    assert_eq!(value("href"), "x?a=1&amp=2&b=3");
+    assert_eq!(value("title"), "A & B");
+}
+
+/// Raw fragments are verbatim — no decoding — and the documented recipe
+/// (reassemble in order, then entity-decode) reproduces the default output.
+#[tokio::test]
+async fn raw_text_fragments_are_verbatim_and_decode_after_reassembly() {
+    let client = start_server().await;
+    let base = pb::ExtractOptions {
+        rules: vec![pb::ExtractRule {
+            id: "case".to_owned(),
+            selector: "p#case".to_owned(),
+            captures: vec![pb::Capture::Text as i32],
+        }],
+        ..Default::default()
+    };
+
+    let coalesced = extract_file(&client, "entities.html", base.clone(), 3).await;
+    let raw = extract_file(
+        &client,
+        "entities.html",
+        pb::ExtractOptions {
+            raw_text_chunks: true,
+            ..base
+        },
+        3,
+    )
+    .await;
+
+    let whole = only!(coalesced, Event::Text);
+    let pieces = only!(raw, Event::Text);
+
+    let rejoined: String = pieces.iter().map(|piece| piece.text.as_str()).collect();
+    assert!(
+        rejoined.contains("&amp;"),
+        "raw fragments must be verbatim, got {rejoined:?}"
+    );
+    assert_eq!(htmlize::unescape(&rejoined), whole[0].text);
 }
 
 // ---------------------------------------------------------------------------

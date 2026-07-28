@@ -567,9 +567,21 @@ fn text_handler(
             // empty terminating chunk for every node, so this is the common
             // case rather than an edge one.
             if !buffer.is_empty() {
+                // lol-html hands text back exactly as written, so the entity
+                // decode the proto promises for DATA and RCDATA happens
+                // here, after reassembly — an entity split across fragments
+                // is whole again by this point. Raw mode never reaches this
+                // branch: fragments go out verbatim, as documented.
+                let text = if chunk.text_type().allows_html_entities()
+                    && buffer.contains('&')
+                {
+                    htmlize::unescape(buffer.as_str()).into_owned()
+                } else {
+                    std::mem::take(&mut buffer)
+                };
                 let _ = sink.send(pb::extract_response::Event::Text(pb::TextNode {
                     rule_id: rule_id.clone(),
-                    text: std::mem::take(&mut buffer),
+                    text,
                     text_type: text_type as i32,
                     span: span.map(|(start, end)| pb::SourceSpan { start, end }),
                     last_in_node: true,

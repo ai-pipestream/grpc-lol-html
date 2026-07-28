@@ -569,8 +569,12 @@ pub struct ExtractOptions {
     /// Setting this true gives you the fragments as lol-html produced them, with
     /// `last_in_node` marking the end of each node. That keeps server memory
     /// constant even for a single enormous text node, at the cost of doing the
-    /// reassembly yourself. Reassembling in order reproduces the default output
-    /// exactly.
+    /// reassembly yourself.
+    ///
+    /// Raw fragments are verbatim: no entity decoding, because an entity can be
+    /// split across two fragments and a fragment-at-a-time decode would corrupt
+    /// it. Reassembling in order and then entity-decoding DATA and RCDATA nodes
+    /// yourself reproduces the default output exactly.
     #[prost(bool, tag="8")]
     pub raw_text_chunks: bool,
     /// Which kinds of text to report. Empty means `\[DATA, RCDATA\]`, that is,
@@ -689,7 +693,9 @@ pub struct TextNode {
     /// text outside every element.
     #[prost(string, tag="1")]
     pub rule_id: ::prost::alloc::string::String,
-    /// The text. Entity decoded only for DATA and RCDATA; see TextType.
+    /// The text. Entity decoded only for DATA and RCDATA (see TextType), and
+    /// only in the default reassembled mode — `raw_text_chunks` fragments are
+    /// verbatim.
     #[prost(string, tag="2")]
     pub text: ::prost::alloc::string::String,
     /// What kind of text this is. Always set, and worth checking before you
