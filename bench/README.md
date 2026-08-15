@@ -50,8 +50,8 @@ checked for determinism across iterations.
 
 The synthetic corpus is deterministic and shaped like something worth scraping:
 nested layout wrappers, links with several attributes, headings, prose of
-varying length, images, and the `<script>` and `<style>` blocks that are a
-depressing share of a real page. A document that is 90% text and one that is
+varying length, images, and the `<script>` and `<style>` blocks that make up
+much of a real page. A document that is 90% text and one that is
 90% tags exercise completely different parts of a tokenizer, so the mix is not
 incidental.
 

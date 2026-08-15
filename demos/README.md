@@ -152,6 +152,7 @@ them at six different chunk sizes and compare the streams in full.
 | `doctype_legacy.html` | a doctype carrying public and system identifiers |
 | `unclosed_tags.html` | elements that never close, so no end-tag events |
 | `duplicate_and_bare_attrs.html` | attribute case, bare attributes, and their spans |
+| `entities.html` | entity decoding in prose text, and verbatim raw text fragments |
 | `json_ld_product.html` | structured data in a `<script type="application/ld+json">` |
 | `spa_shell.html` | a page whose content does not exist until JavaScript runs |
 

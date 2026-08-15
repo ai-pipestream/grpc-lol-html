@@ -13,6 +13,24 @@ cargo run --release
 
 You send HTML chunks. It sends back what matched, as it matches.
 
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as LolHtmlService
+    participant P as lol-html parser
+    C->>S: options (rules, encoding, limits)
+    S->>S: compile and validate rules
+    S-->>C: started { encoding, rule_count }
+    loop until half-close
+        C->>S: chunk of document bytes
+        S->>P: feed bytes
+        P-->>S: element / text / comment / doctype
+        S-->>C: match events, as they occur
+    end
+    C->>S: half-close
+    S-->>C: finished { bytes_parsed, matches_by_rule } or terminal error
+```
+
 ```
 client ->  [0] options { rules: [{ id: "links", selector: "a[href]", captures: [ATTRIBUTES] }] }
 client ->  [1] chunk (64 KiB)
@@ -61,11 +79,22 @@ cd demos/node-client && npm install && npm start   # http://127.0.0.1:8080
 > First match after **48 B of 305 B** (16% uploaded). The rest of the document
 > had not been sent yet.
 
+## Configuration
+
+All optional, read at startup:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `GRPC_LOL_HTML_ADDR` | `0.0.0.0:50051` | listen address |
+| `GRPC_LOL_HTML_WORKERS` | CPU count | tokio worker threads |
+| `GRPC_LOL_HTML_MAX_CHUNK_BYTES` | 100 MiB | largest inbound chunk accepted |
+| `GRPC_LOL_HTML_WINDOW_BYTES` | 4 MiB | HTTP/2 initial stream and connection window |
+
 ## Where you split the upload is invisible
 
 Chunk size is a throughput knob and nothing else. `tests/extract.rs` replays
 every fixture at 1, 3, 7, 64, 1024 and whole-document chunk sizes and compares
-the resulting event streams **in full** — every field, including byte spans and
+the resulting event streams **in full**: every field, including byte spans and
 the final `bytes_parsed`.
 
 This is the load-bearing test, and it earned its keep: it is what caught both
@@ -159,30 +188,33 @@ common way to get an empty result out of this service.
 
 ## Safety
 
-- **Memory is capped whether or not you ask.** lol-html defaults
-  `max_allowed_memory_usage` to `usize::MAX`; a server taking documents off the
-  open web must not run that way, so an unset or zero `limits.max_bytes` means
-  64 MiB rather than infinity. Exceeding it is a typed error, or a truncated
-  success carrying `bailed_out` if you set `graceful_bail_out`. Either way the
-  process survives, which `a_document_over_its_memory_cap_fails_in_band_and_the_server_survives`
-  checks by streaming a second document through afterwards. The cap bounds
-  parser state; what keeps total memory flat is that nothing is retained, which
-  is the table above.
-- **UTF-16 is refused up front.** lol-html's tokenizer scans for ASCII markup
-  bytes, so UTF-16LE/BE, ISO-2022-JP and `replacement` are rejected with
-  `INVALID_ARGUMENT`. Transcode first.
-- **Chunk size is capped** at 100 MiB, tunable with
-  `GRPC_LOL_HTML_MAX_CHUNK_BYTES`. This is not a document size limit; a
-  document is any number of chunks and has no ceiling. It bounds how much one
-  message carries, and so how long a single uninterruptible parse can hold an
-  async worker. tonic's own decoding limit is derived from it at twice the
-  value, deliberately above rather than equal, so an ordinary overshoot gets
-  the `INVALID_ARGUMENT` that names the limit rather than the transport's
-  `OutOfRange`.
+**Memory is capped whether or not you ask.** lol-html defaults
+`max_allowed_memory_usage` to `usize::MAX`; a server taking documents off the
+open web must not run that way, so an unset or zero `limits.max_bytes` means
+64 MiB rather than infinity. Exceeding it is a typed error, or a truncated
+success carrying `bailed_out` if you set `graceful_bail_out`. Either way the
+process survives, which
+`a_document_over_its_memory_cap_fails_in_band_and_the_server_survives` checks
+by streaming a second document through afterwards. The cap bounds parser state;
+what keeps total memory flat is that nothing is retained, which is the table
+above.
 
-  Sending a chunk that large is allowed but pointless. The benchmark plateaus
-  around 256 KiB: 16 KiB against 1 MiB is roughly 85 against 96 MiB/s, and
-  above that nothing improves while the per-call buffer grows.
+**UTF-16 is refused up front.** lol-html's tokenizer scans for ASCII markup
+bytes, so UTF-16LE/BE, ISO-2022-JP and `replacement` are rejected with
+`INVALID_ARGUMENT`. Transcode first.
+
+**Chunk size is capped** at 100 MiB, tunable with
+`GRPC_LOL_HTML_MAX_CHUNK_BYTES`. This is not a document size limit; a document
+is any number of chunks and has no ceiling. It bounds how much one message
+carries, and so how long a single uninterruptible parse can hold an async
+worker. tonic's own decoding limit is derived from it at twice the value,
+deliberately above rather than equal, so an ordinary overshoot gets the
+`INVALID_ARGUMENT` that names the limit rather than the transport's
+`OutOfRange`.
+
+Sending a chunk that large is allowed but pointless. The benchmark plateaus
+around 256 KiB: 16 KiB against 1 MiB is roughly 85 against 96 MiB/s, and above
+that nothing improves while the per-call buffer grows.
 
 ## Two things lol-html gets wrong
 
@@ -235,7 +267,7 @@ hypotheses about where the cost goes that turned out to be wrong.
 
 ```bash
 cargo build --release
-cargo test                                              # 39 tests
+cargo test                                              # 43 tests
 cargo clippy --all-targets --all-features -- -Dwarnings
 buf lint && buf build
 buf generate                                            # regenerate src/gen
@@ -243,10 +275,10 @@ buf build -o src/gen/file_descriptor_set.binpb          # regenerate the reflect
 demos/compare-clients.sh                                # needs a running server
 ```
 
-The server also exposes gRPC reflection (v1) from a `FileDescriptorSet`
-checked in at `src/gen/file_descriptor_set.binpb` — the same `buf build`
-output, kept next to the generated Rust since codegen runs through buf rather
-than a build.rs. Rebuild it after any proto change; with it, clients such as
+The server also exposes gRPC reflection (v1) from a `FileDescriptorSet` checked
+in at `src/gen/file_descriptor_set.binpb`: the same `buf build` output, kept
+next to the generated Rust since codegen runs through buf rather than a
+build.rs. Rebuild it after any proto change; with it, clients such as
 `grpcurl -plaintext localhost:50051 list` need no local .proto files.
 
 MSRV is 1.88, set by tonic 0.14 rather than by lol-html, which builds on 1.85.
