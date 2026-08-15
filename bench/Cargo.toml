@@ -20,4 +20,4 @@ tonic = { version = "0.14.6", features = ["gzip", "zstd"] }
 
 # The DOM reference arm. `scraper` is html5ever plus a selector engine, which
 # is the thing lol-html is deliberately not.
-scraper = "0.22"
+scraper = "0.27"

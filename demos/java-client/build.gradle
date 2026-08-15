@@ -7,7 +7,7 @@
 plugins {
     id 'java'
     id 'application'
-    id 'com.google.protobuf' version '0.9.6'
+    id 'com.google.protobuf' version '0.10.0'
 }
 
 repositories {
@@ -18,8 +18,8 @@ repositories {
 // reads, and grpc-java's protoc plugin has to match the runtime it generates
 // against.
 ext {
-    grpcVersion = '1.68.1'
-    protobufVersion = '4.28.3'
+    grpcVersion = '1.83.1'
+    protobufVersion = '4.35.1'
 }
 
 dependencies {
