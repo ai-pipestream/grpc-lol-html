@@ -91,6 +91,12 @@ async fn start_server_process() -> (ServerProcess, LolHtmlServiceClient<Channel>
 
     let child = Command::new(env!("CARGO_BIN_EXE_grpc-lol-html"))
         .env("GRPC_LOL_HTML_ADDR", &addr)
+        // mimalloc holds freed spans for a purge delay before returning them,
+        // which is allocator caching proportional to throughput, not document
+        // retention — and exactly the noise this test exists to exclude.
+        // Zeroing the delay makes the shipped binary behave for the
+        // measurement like the reading the claim needs.
+        .env("MIMALLOC_PURGE_DELAY", "0")
         .spawn()
         .expect("spawn the server binary");
     let server = ServerProcess(child);

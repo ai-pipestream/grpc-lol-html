@@ -1,0 +1,9 @@
+# Everything the image build does not need. Keeping the context small also
+# keeps a stale host `target/` (gigabytes, and built against the wrong libc)
+# out of the builder; `bench/target` is the same problem in a second coat.
+target/
+bench/target/
+.git/
+.github/
+logs/
+run/
