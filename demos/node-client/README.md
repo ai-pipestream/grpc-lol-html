@@ -14,7 +14,7 @@ node cli.js ../sample-data/cdata_svg.html "a[href]"
 npm start
 ```
 
-Both honour `LOL_HTML_ADDR` (default `127.0.0.1:50053`). The viewer also takes
+Both honour `LOL_HTML_ADDR` (default `127.0.0.1:50057`). The viewer also takes
 `PORT` (default 8080).
 
 ## The web viewer

@@ -3,7 +3,7 @@
 //! Binary entry point for the lol-html gRPC server.
 //!
 //! Runtime sizing (all optional environment overrides):
-//! - `GRPC_LOL_HTML_ADDR` — listen address (default `0.0.0.0:50053`).
+//! - `GRPC_LOL_HTML_ADDR` — listen address (default `0.0.0.0:50057`).
 //! - `GRPC_LOL_HTML_WORKERS` — tokio worker threads (default: CPU count).
 //! - `GRPC_LOL_HTML_MAX_CHUNK_BYTES` — largest inbound chunk accepted
 //!   (default: 100 MiB). Not a document size limit: a document is any number
@@ -42,7 +42,7 @@ use grpc_lol_html::proto::v1 as pb;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Default listen address when `GRPC_LOL_HTML_ADDR` is not set.
-const DEFAULT_ADDR: &str = "0.0.0.0:50053";
+const DEFAULT_ADDR: &str = "0.0.0.0:50057";
 
 /// Serialized `FileDescriptorSet` for `proto/lolhtml/v1`, backing gRPC server
 /// reflection.

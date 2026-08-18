@@ -35,7 +35,7 @@ export const CHUNK_BYTES = 64 * 1024;
 /** A connected grpc-lol-html client. */
 export class LolHtmlClient {
   /** @param {string} address host:port of the grpc-lol-html server. */
-  constructor(address = process.env.LOL_HTML_ADDR ?? "127.0.0.1:50053") {
+  constructor(address = process.env.LOL_HTML_ADDR ?? "127.0.0.1:50057") {
     this.stub = new lolhtml.v1.LolHtmlService(
       address,
       grpc.credentials.createInsecure(),

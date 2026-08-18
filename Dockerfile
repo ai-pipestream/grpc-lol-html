@@ -32,7 +32,7 @@ RUN cargo build --release --locked
 # disk, so the container can and should run with `--read-only`.
 #
 #   docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
-#     -p 50053:50053 grpc-lol-html
+#     -p 50057:50057 grpc-lol-html
 #
 # `:nonroot` runs as uid 65532. Health checking is the orchestrator's job over
 # gRPC (`grpc.health.v1.Health/Check`, which this server registers) rather than
@@ -42,7 +42,7 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=builder /src/target/release/grpc-lol-html /usr/local/bin/grpc-lol-html
 
-ENV GRPC_LOL_HTML_ADDR=0.0.0.0:50053
-EXPOSE 50053
+ENV GRPC_LOL_HTML_ADDR=0.0.0.0:50057
+EXPOSE 50057
 USER nonroot
 ENTRYPOINT ["/usr/local/bin/grpc-lol-html"]

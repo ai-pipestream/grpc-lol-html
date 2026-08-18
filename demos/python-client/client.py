@@ -211,7 +211,7 @@ def main() -> int:
         text_types=text_types,
     )
 
-    address = os.environ.get("LOL_HTML_ADDR", "127.0.0.1:50053")
+    address = os.environ.get("LOL_HTML_ADDR", "127.0.0.1:50057")
     with grpc.insecure_channel(address) as channel:
         stub = svc_grpc.LolHtmlServiceStub(channel)
 
