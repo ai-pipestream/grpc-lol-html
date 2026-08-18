@@ -114,7 +114,7 @@ public final class LolHtmlDemo {
                     TextType.TEXT_TYPE_RAW_TEXT));
         }
 
-        String address = System.getenv().getOrDefault("LOL_HTML_ADDR", "127.0.0.1:50051");
+        String address = System.getenv().getOrDefault("LOL_HTML_ADDR", "127.0.0.1:50053");
         ManagedChannel channel =
                 Grpc.newChannelBuilder(address, InsecureChannelCredentials.create()).build();
 

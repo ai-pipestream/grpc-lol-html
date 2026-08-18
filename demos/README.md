@@ -12,7 +12,7 @@ Start the server first, from the repository root:
 
 ```bash
 cargo run --release
-# grpc-lol-html listening on 0.0.0.0:50051
+# grpc-lol-html listening on 0.0.0.0:50053
 ```
 
 | Demo | Stack | Run it |
@@ -27,7 +27,7 @@ marker at the byte where the first one landed. See
 [`node-client/README.md`](node-client/README.md).
 
 All three take the same arguments, honour `LOL_HTML_ADDR` (default
-`127.0.0.1:50051`), and print **byte-identical output**. That agreement is the
+`127.0.0.1:50053`), and print **byte-identical output**. That agreement is the
 point of having three of them: each reads the same contract through a different
 generated-code toolchain, so agreement is evidence the contract says what it
 means, and divergence is evidence one of them is guessing.

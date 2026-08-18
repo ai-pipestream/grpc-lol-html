@@ -6,7 +6,7 @@ rewriter and the engine behind Workers' `HTMLRewriter`.
 
 ```bash
 cargo run --release
-# INFO grpc_lol_html: grpc-lol-html listening addr=0.0.0.0:50051 window=4194304
+# INFO grpc_lol_html: grpc-lol-html listening addr=0.0.0.0:50053 window=4194304
 ```
 
 ## What it is
@@ -85,7 +85,7 @@ All optional, read at startup:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `GRPC_LOL_HTML_ADDR` | `0.0.0.0:50051` | listen address |
+| `GRPC_LOL_HTML_ADDR` | `0.0.0.0:50053` | listen address |
 | `GRPC_LOL_HTML_WORKERS` | CPU count | tokio worker threads |
 | `GRPC_LOL_HTML_MAX_CHUNK_BYTES` | 100 MiB | largest inbound chunk accepted |
 | `GRPC_LOL_HTML_WINDOW_BYTES` | 4 MiB | HTTP/2 initial stream and connection window |
@@ -307,7 +307,7 @@ cost goes that turned out to be wrong.
 ```bash
 docker build -t grpc-lol-html .
 docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
-  -p 50051:50051 grpc-lol-html
+  -p 50053:50053 grpc-lol-html
 ```
 
 The build stage runs the test suite and then compiles with fat LTO and
@@ -333,7 +333,7 @@ The server also exposes gRPC reflection (v1) from a `FileDescriptorSet` checked
 in at `src/gen/file_descriptor_set.binpb`: the same `buf build` output, kept
 next to the generated Rust since codegen runs through buf rather than a
 build.rs. Rebuild it after any proto change; with it, clients such as
-`grpcurl -plaintext localhost:50051 list` need no local .proto files.
+`grpcurl -plaintext localhost:50053 list` need no local .proto files.
 
 MSRV is 1.88, set by tonic 0.14 rather than by lol-html, which builds on 1.85.
 

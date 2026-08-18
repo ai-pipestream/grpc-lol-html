@@ -15,7 +15,7 @@
 //
 //   node server.js            # http://127.0.0.1:8080
 //
-// Environment: LOL_HTML_ADDR (default 127.0.0.1:50051), PORT (default 8080).
+// Environment: LOL_HTML_ADDR (default 127.0.0.1:50053), PORT (default 8080).
 
 import { createServer } from "node:http";
 import { readFile, readdir, stat } from "node:fs/promises";
@@ -24,7 +24,7 @@ import path from "node:path";
 import { LolHtmlClient } from "./lib/lolhtml.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
-const ADDR = process.env.LOL_HTML_ADDR ?? "127.0.0.1:50051";
+const ADDR = process.env.LOL_HTML_ADDR ?? "127.0.0.1:50053";
 const client = new LolHtmlClient(ADDR);
 const publicDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "public");
 
