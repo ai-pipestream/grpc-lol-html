@@ -42,6 +42,12 @@ mod digest;
 
 use digest::Digest;
 
+// Same allocator as the shipped server binary (`src/main.rs`), so the numbers
+// describe the artifact this repo ships rather than a differently-allocated
+// cousin of it.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Selectors every arm runs by default, chosen to be expressible in all three.
 ///
 /// Nothing here needs whole-tree context, because lol-html could not evaluate
@@ -180,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         document.len().div_ceil(args.chunk)
     );
     println!("  http2 window: {} bytes", args.window);
-    println!("  profile     : release (cargo defaults)");
+    println!("  profile     : release (fat LTO, 1 codegen unit, mimalloc)");
     println!();
 
     let mut native = Vec::new();

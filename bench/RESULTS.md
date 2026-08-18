@@ -1,13 +1,15 @@
 # Captured results
 
-Captured 2026-07-27. These describe one machine on one day. Re-run the harness
+Captured 2026-08-18. These describe one machine on one day. Re-run the harness
 (see [README.md](README.md)) rather than quoting them against different
 hardware.
 
-Host: 32 logical cores, Linux 7.0.0-28-generic. Build: release profile, cargo
-defaults, no `[profile.release]` overrides. Client and server share the machine
-and the tokio runtime, so this measures what gRPC costs, not what a network
-costs.
+Host: 32 logical cores, Linux 7.0.0-28-generic. Build: the release profile the
+repo now ships — fat LTO, one codegen unit, mimalloc. The previous capture
+(2026-07-27) ran cargo defaults and read 324 native / 123 over gRPC / 95 DOM,
+so the profile and allocator change alone moved the wire arm by roughly 45
+percent on this machine. Client and server share the machine and the tokio
+runtime, so this measures what gRPC costs, not what a network costs.
 
 ## The headline
 
@@ -16,15 +18,15 @@ process.**
 
 ```
   arm                                best        MiB/s  vs native
-  in-process lol-html               49.3ms          324      1.00x
-  over gRPC                        129.7ms          123      2.63x
-  scraper (html5ever + DOM)        168.1ms           95      3.41x
+  in-process lol-html               41.2ms          389      1.00x
+  over gRPC                         89.8ms          178      2.18x
+  scraper (html5ever + DOM)        144.3ms          111      3.50x
 ```
 
 Synthetic 16 MiB corpus, 256 KiB chunks, 7 iterations interleaved, 135,426
 elements matched by `a[href], h2, p.body, img[src]`.
 
-You pay about 2.6x against in-process lol-html for serialization and a socket,
+You pay about 2.2x against in-process lol-html for serialization and a socket,
 and still come out ahead of html5ever with a DOM, which pays no transport cost
 at all. That is the trade this service is making: a network hop and a language
 boundary, for less than what a tree costs.
@@ -45,34 +47,43 @@ ok   arm 2 matched the same 135426 elements, grouped by selector rather than int
 Same configuration at 64 MiB, 540,900 matches:
 
 ```
-  in-process lol-html              195.3ms          328      1.00x
-  over gRPC                        520.8ms          123      2.67x
-  scraper (html5ever + DOM)        674.8ms           95      3.46x
+  in-process lol-html              165.5ms          387      1.00x
+  over gRPC                        359.1ms          178      2.17x
+  scraper (html5ever + DOM)        858.1ms           75      5.19x
 ```
 
-Throughput and ratios are unchanged from 16 MiB, which is what the streaming
-design predicts: nothing here is proportional to document size except the
-document.
+Throughput for the lol-html arms is unchanged from 16 MiB, which is what the
+streaming design predicts: nothing here is proportional to document size except
+the document. The DOM arm's number wobbles badly at this size — 75 MiB/s here,
+25 in another run of the same configuration — as the retained tree stops
+fitting in cache. It stays far from the wire arm in either reading, which is
+the only claim this section makes about it.
 
-## Upload chunk size is the knob that matters
+## Upload chunk size matters less than it used to
 
 Same 16 MiB document, varying only how many messages it becomes:
 
 | chunk | messages | over gRPC |
 |---|---|---|
-| 16 KiB | 1024 | ~85 MiB/s |
-| 64 KiB | 256 | ~82 MiB/s |
-| 256 KiB | 64 | ~95 to 123 MiB/s |
-| 1 MiB | 16 | ~96 MiB/s |
-| 16 MiB | 1 | ~96 MiB/s |
+| 16 KiB | 1025 | ~131 MiB/s |
+| 64 KiB | 257 | ~120 MiB/s |
+| 256 KiB | 65 | ~127 to 178 MiB/s |
+| 1 MiB | 17 | ~121 MiB/s |
+| 16 MiB | 2 | ~170 MiB/s |
 
-It plateaus by 256 KiB and buys nothing above 1 MiB. The spread within the last
-three rows is run-to-run variance, not a trend; do not read a ranking into it.
-**256 KiB is the recommendation** and is the harness default.
+The old capture showed a plateau by 256 KiB and nothing gained above 1 MiB;
+that is no longer what the machine says. Rows from 16 KiB to 1 MiB are all
+inside run-to-run variance of each other, and the two-message extreme measured
+~170 MiB/s in both a 5-iteration and a 7-iteration run — repeatable, not noise.
+Per-message cost got cheap enough (LTO, mimalloc) that the number of messages
+mostly stops mattering, and a client that can buffer the document whole does
+best of all. Chunk at whatever size the client already has; there is no longer
+a sweet spot to hit.
 
 ## What the cost is not
 
-Two hypotheses tested and rejected, so nobody re-tests them:
+Two hypotheses tested and rejected on the earlier capture, so nobody re-tests
+them. The mechanism has not changed, only the constants:
 
 **Not the response messages.** A selector matching nothing still costs 183 ms
 against 15 ms native on the same 16 MiB document. With zero events returned,
@@ -88,7 +99,7 @@ decode. It is proportional to the document and not to the match count.
 
 ## Variance
 
-Run-to-run spread on a busy machine is tens of percent. The 256 KiB row above
-measured 95 MiB/s in one sweep and 123 MiB/s in another, same configuration.
+Run-to-run spread on a busy machine is tens of percent. Identical 256 KiB
+configurations in this capture measured 127, 131 and 178 MiB/s on the wire arm.
 Use `--iterations 7` or more before believing any comparison, and prefer
 re-running both arms to comparing against a number written here.

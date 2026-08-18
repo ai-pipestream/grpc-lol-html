@@ -13,6 +13,9 @@ publish = false
 # measures. Anything else and the comparison is between two different things.
 grpc-lol-html = { path = ".." }
 lol_html = "3.0.0"
+# Same allocator the shipped server runs on, for the same reason as the path
+# dependency above: the numbers must describe the binary this repo ships.
+mimalloc = "0.1.48"
 prost = "0.14.4"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
@@ -21,3 +24,11 @@ tonic = { version = "0.14.6", features = ["gzip", "zstd"] }
 # The DOM reference arm. `scraper` is html5ever plus a selector engine, which
 # is the thing lol-html is deliberately not.
 scraper = "0.27"
+
+# The root crate ships with fat LTO and one codegen unit; this crate is what
+# actually gets measured, so it mirrors that profile or the numbers describe
+# a binary nobody runs.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
