@@ -236,6 +236,24 @@ impl pb::lol_html_service_server::LolHtmlService for LolHtmlGrpc {
         let diagnostics = rules::diagnose(&request.into_inner().rules);
         Ok(Response::new(pb::ValidateSelectorsResponse { diagnostics }))
     }
+
+    async fn get_service_info(
+        &self,
+        _request: Request<pb::GetServiceInfoRequest>,
+    ) -> Result<Response<pb::GetServiceInfoResponse>, Status> {
+        // The UI block is a property of the build, hardcoded to match the
+        // frontend this repo ships, so the shared demo shell can mount it
+        // without any configuration.
+        Ok(Response::new(pb::GetServiceInfoResponse {
+            name: "grpc-lol-html".to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            ui: Some(pb::UiInfo {
+                title: "LOL HTML".to_owned(),
+                path: "/ui/lol-html".to_owned(),
+                description: "Streams CSS-selector matches out of HTML via lol-html".to_owned(),
+            }),
+        }))
+    }
 }
 
 /// Run one document through the rewriter, forwarding events as they occur.

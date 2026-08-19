@@ -59,6 +59,13 @@ service LolHtmlService {
   // rejected here: nothing requiring whole-tree context can be evaluated by
   // a parser that never builds a tree. Checking costs one cheap round trip.
   rpc ValidateSelectors(ValidateSelectorsRequest) returns (ValidateSelectorsResponse);
+
+  // Reports who this server is and where its web frontend lives.
+  //
+  // The shared demo shell discovers its tabs by calling this on every
+  // ai-pipestream service, so `ui` carries the same `UiInfo` shape as in
+  // every other service in the family.
+  rpc GetServiceInfo(GetServiceInfoRequest) returns (GetServiceInfoResponse);
 }
 
 // ExtractRequest is one frame of the request stream.
@@ -367,4 +374,35 @@ message ValidateSelectorsResponse {
   // One entry per selector that failed to compile, in submission order.
   // Empty means every selector compiled.
   repeated SelectorDiagnostic diagnostics = 1;
+}
+
+// GetServiceInfoRequest asks the server who it is. It carries nothing; the
+// answer is a property of the build, not of the caller.
+message GetServiceInfoRequest {}
+
+// GetServiceInfoResponse reports the server's identity and its UI
+// advertisement for the shared demo shell.
+message GetServiceInfoResponse {
+  // The repository name, `grpc-lol-html`.
+  string name = 1;
+
+  // The build version, the crate version the binary was compiled from.
+  string version = 2;
+
+  // Frontend advertisement. Same shape in every ai-pipestream grpc service:
+  // the demo shell reads it to build its tab bar.
+  UiInfo ui = 3;
+}
+
+// UiInfo tells the shared demo shell how to mount this service's web
+// frontend as a tab.
+message UiInfo {
+  // Tab title, e.g. "EPUB".
+  string title = 1;
+
+  // Shell mount path, e.g. "/ui/epub".
+  string path = 2;
+
+  // One line, used as the tab tooltip.
+  string description = 3;
 }

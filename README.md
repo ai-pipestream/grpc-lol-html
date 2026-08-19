@@ -206,6 +206,10 @@ closes. None of these are pending work.
 sending a document. One cheap round trip, and selector mistakes are the most
 common way to get an empty result out of this service.
 
+`GetServiceInfo` reports the server's name, build version and the shared
+`UiInfo` advertisement the ai-pipestream demo shell reads to mount this
+service's web frontend as a tab.
+
 ## Safety
 
 **Memory is capped whether or not you ask.** lol-html defaults

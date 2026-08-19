@@ -811,5 +811,39 @@ pub struct ValidateSelectorsResponse {
     #[prost(message, repeated, tag="1")]
     pub diagnostics: ::prost::alloc::vec::Vec<SelectorDiagnostic>,
 }
+/// GetServiceInfoRequest asks the server who it is. It carries nothing; the
+/// answer is a property of the build, not of the caller.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetServiceInfoRequest {
+}
+/// GetServiceInfoResponse reports the server's identity and its UI
+/// advertisement for the shared demo shell.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetServiceInfoResponse {
+    /// The repository name, `grpc-lol-html`.
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    /// The build version, the crate version the binary was compiled from.
+    #[prost(string, tag="2")]
+    pub version: ::prost::alloc::string::String,
+    /// Frontend advertisement. Same shape in every ai-pipestream grpc service:
+    /// the demo shell reads it to build its tab bar.
+    #[prost(message, optional, tag="3")]
+    pub ui: ::core::option::Option<UiInfo>,
+}
+/// UiInfo tells the shared demo shell how to mount this service's web
+/// frontend as a tab.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UiInfo {
+    /// Tab title, e.g. "EPUB".
+    #[prost(string, tag="1")]
+    pub title: ::prost::alloc::string::String,
+    /// Shell mount path, e.g. "/ui/epub".
+    #[prost(string, tag="2")]
+    pub path: ::prost::alloc::string::String,
+    /// One line, used as the tab tooltip.
+    #[prost(string, tag="3")]
+    pub description: ::prost::alloc::string::String,
+}
 include!("lolhtml.v1.tonic.rs");
 // @@protoc_insertion_point(module)
