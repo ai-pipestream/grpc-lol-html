@@ -3,6 +3,7 @@
 # out of the builder; `bench/target` is the same problem in a second coat.
 target/
 bench/target/
+demos/node-client/node_modules/
 .git/
 .github/
 logs/
