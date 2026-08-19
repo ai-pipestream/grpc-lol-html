@@ -17,6 +17,20 @@ npm start
 Both honour `LOL_HTML_ADDR` (default `127.0.0.1:50057`). The viewer also takes
 `PORT` (default 8080).
 
+### Serving under a base path
+
+Set `UI_BASE` and the whole viewer moves under that prefix, for example behind
+a reverse proxy that forwards `/ui/lol-html/*` unchanged:
+
+```bash
+UI_BASE=/ui/lol-html npm start   # page at http://127.0.0.1:8080/ui/lol-html/
+```
+
+The bridge strips the prefix before routing, so every endpoint lives at
+`$UI_BASE/api/*`, and it injects a `<meta name="ui-base">` tag into the served
+page, which the page reads to prefix its own `fetch()` calls. Unset, nothing
+changes: the bridge answers at the root exactly as before.
+
 ## The web viewer
 
 The viewer exists to make one property visible: **matches arrive before the
