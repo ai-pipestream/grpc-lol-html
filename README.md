@@ -316,7 +316,8 @@ docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
 
 The build stage runs the test suite and then compiles with fat LTO and
 `panic = "abort"`; a red suite fails the image rather than shipping. The
-runtime is distroless and runs as a non-root user with no shell, which is why
+runtime is `dhi.io/debian-base:trixie-debian13` and runs as a non-root user
+with no shell, which is why
 health checking is the orchestrator's job over `grpc.health.v1.Health/Check`
 rather than a Dockerfile `HEALTHCHECK`. Codegen is checked in, so the build
 needs neither buf nor protoc.

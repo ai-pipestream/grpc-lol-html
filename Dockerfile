@@ -14,8 +14,11 @@
 # buf.gen.yaml) and the generated Rust is checked in, so the image build needs
 # a Rust toolchain and nothing else.
 # ---------------------------------------------------------------------------
-FROM rust:1-slim-bookworm AS builder
+FROM dhi.io/rust:1 AS builder
 
+# The hardened toolchain image runs as a nonroot user; the build needs to
+# write only under /src and the cargo home, so give it a writable workspace.
+USER root
 WORKDIR /src
 COPY . .
 
@@ -27,18 +30,20 @@ RUN cargo build --release --locked
 # ---------------------------------------------------------------------------
 # Runtime stage.
 #
-# distroless/cc: glibc and libgcc, no shell, no package manager, nothing else.
-# There is no hot path that needs a shell, and this service never writes to
-# disk, so the container can and should run with `--read-only`.
+# Docker Hardened Images debian-base: glibc and libgcc, no package manager,
+# pulls from the docker.io ecosystem (dhi.io) with signed provenance, and
+# runs as uid 65532 out of the box. There is no hot path that needs a shell,
+# and this service never writes to disk, so the container can and should run
+# with `--read-only`.
 #
 #   docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
 #     -p 50057:50057 grpc-lol-html
 #
-# `:nonroot` runs as uid 65532. Health checking is the orchestrator's job over
+# Health checking is the orchestrator's job over
 # gRPC (`grpc.health.v1.Health/Check`, which this server registers) rather than
 # a Dockerfile HEALTHCHECK, because there is no shell here to run one with.
 # ---------------------------------------------------------------------------
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM dhi.io/debian-base:trixie-debian13
 
 COPY --from=builder /src/target/release/grpc-lol-html /usr/local/bin/grpc-lol-html
 
