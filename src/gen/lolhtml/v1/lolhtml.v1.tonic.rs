@@ -140,6 +140,30 @@ pub mod lol_html_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        pub async fn get_service_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetServiceInfoRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetServiceInfoResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lolhtml.v1.LolHtmlService/GetServiceInfo",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("lolhtml.v1.LolHtmlService", "GetServiceInfo"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -170,6 +194,13 @@ pub mod lol_html_service_server {
             request: tonic::Request<super::ValidateSelectorsRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ValidateSelectorsResponse>,
+            tonic::Status,
+        >;
+        async fn get_service_info(
+            &self,
+            request: tonic::Request<super::GetServiceInfoRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetServiceInfoResponse>,
             tonic::Status,
         >;
     }
@@ -328,6 +359,52 @@ pub mod lol_html_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ValidateSelectorsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lolhtml.v1.LolHtmlService/GetServiceInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetServiceInfoSvc<T: LolHtmlService>(pub Arc<T>);
+                    impl<
+                        T: LolHtmlService,
+                    > tonic::server::UnaryService<super::GetServiceInfoRequest>
+                    for GetServiceInfoSvc<T> {
+                        type Response = super::GetServiceInfoResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetServiceInfoRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LolHtmlService>::get_service_info(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetServiceInfoSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

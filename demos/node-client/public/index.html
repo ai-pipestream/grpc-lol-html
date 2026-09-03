@@ -170,6 +170,11 @@
 const $ = (id) => document.getElementById(id);
 const feed = $("feed");
 
+// The BFF injects this meta tag when it serves the page under a path prefix
+// (UI_BASE). Empty when the bridge runs at the root, so calls below are
+// unprefixed and nothing changes.
+const BASE = document.querySelector('meta[name="ui-base"]')?.content ?? "";
+
 /// Keep the DOM bounded. The HTML spec produces over 400,000 events and the
 /// browser is not the thing this demo is trying to stress.
 const MAX_ROWS = 600;
@@ -185,7 +190,7 @@ const kb = (n) =>
   : `${(n / 1024 / 1024).toFixed(1)} MiB`;
 
 async function loadSamples() {
-  const { files } = await (await fetch("/api/samples")).json();
+  const { files } = await (await fetch(`${BASE}/api/samples`)).json();
   $("sample").innerHTML = files
     .map((f) => `<option value="${esc(f.name)}">${esc(f.name)} (${kb(f.size)})</option>`)
     .join("");
@@ -313,7 +318,7 @@ async function stream() {
   const picked = $("pick").files[0];
   const body = picked
     ? await picked.arrayBuffer()
-    : await (await fetch(`/api/samples/${$("sample").value}`)).arrayBuffer();
+    : await (await fetch(`${BASE}/api/samples/${$("sample").value}`)).arrayBuffer();
   sizeBytes = body.byteLength;
   $("sizeLabel").textContent = kb(sizeBytes);
 
@@ -345,7 +350,7 @@ async function stream() {
       .join("");
   };
 
-  const res = await fetch(`/api/extract?${params}`, { method: "POST", body });
+  const res = await fetch(`${BASE}/api/extract?${params}`, { method: "POST", body });
   if (!res.ok) {
     const problem = await res.json();
     row(`<span class="err">${esc(problem.error)}</span> `

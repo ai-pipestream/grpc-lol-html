@@ -30,17 +30,26 @@
 //! inline on the async task rather than on the blocking pool. The cap on
 //! inbound chunk size is what makes that safe: one oversized chunk would be
 //! one long uninterruptible parse.
+//!
+//! Two caps keep one caller from pinning the process: an open stream that
+//! stops sending frames is ended with `DEADLINE_EXCEEDED` after the idle
+//! timeout, and the number of live streams is bounded by a semaphore, past
+//! which calls fail fast with `RESOURCE_EXHAUSTED`. Every finished stream
+//! logs its bytes, matches and duration on a per-stream `extract` span.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use lol_html::errors::RewritingError;
 use lol_html::html_content::{Comment, Doctype, EndTag, TextChunk};
 use lol_html::send::{DocumentContentHandlers, ElementContentHandlers, HtmlRewriter, Settings};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::Instrument;
 
 use crate::proto::v1 as pb;
 use crate::rules::{CompiledOptions, CompiledRule};
@@ -67,7 +76,24 @@ const OUTBOUND_BUFFER: usize = 256;
 /// stayed at 4 MiB, which made every chunk between the two fail with an opaque
 /// `OutOfRange` from the transport instead of the `INVALID_ARGUMENT` below
 /// that says what to do about it.
-const DEFAULT_MAX_CHUNK_BYTES: usize = 100 * 1024 * 1024;
+pub const DEFAULT_MAX_CHUNK_BYTES: usize = 100 * 1024 * 1024;
+
+/// Default for how long an open `Extract` stream may go without an inbound
+/// frame, in milliseconds.
+///
+/// A client that sends its options and then stalls would otherwise pin a
+/// server task forever; this is the bound on that. Sixty seconds is generous
+/// for a protocol whose only reason to pause is a slow upstream of its own.
+pub const DEFAULT_IDLE_TIMEOUT_MS: usize = 60_000;
+
+/// Default cap on simultaneously open `Extract` streams.
+///
+/// Each stream is a parser instance with its own buffers, so an unbounded
+/// count is an unbounded memory commitment. Calls past the cap fail fast with
+/// `RESOURCE_EXHAUSTED` rather than queueing, because a parser that starts
+/// late is worse than a client that retries. This is per-process and
+/// orthogonal to tonic's per-connection `max_concurrent_streams`.
+pub const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 64;
 
 /// Queue the handlers push into, drained after every chunk.
 type EventSink = mpsc::UnboundedSender<pb::extract_response::Event>;
@@ -75,6 +101,8 @@ type EventSink = mpsc::UnboundedSender<pb::extract_response::Event>;
 /// The `lolhtml.v1.LolHtmlService` implementation.
 pub struct LolHtmlGrpc {
     max_chunk_bytes: usize,
+    idle_timeout: Duration,
+    stream_permits: Arc<Semaphore>,
 }
 
 impl Default for LolHtmlGrpc {
@@ -86,16 +114,33 @@ impl Default for LolHtmlGrpc {
 impl LolHtmlGrpc {
     /// Create a service with default limits.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             max_chunk_bytes: DEFAULT_MAX_CHUNK_BYTES,
+            idle_timeout: Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS as u64),
+            stream_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_STREAMS)),
         }
     }
 
     /// Override the largest accepted inbound chunk.
     #[must_use]
-    pub const fn with_max_chunk_bytes(mut self, bytes: usize) -> Self {
+    pub fn with_max_chunk_bytes(mut self, bytes: usize) -> Self {
         self.max_chunk_bytes = bytes;
+        self
+    }
+
+    /// Override how long an `Extract` stream may idle before the server
+    /// ends it with `DEADLINE_EXCEEDED`.
+    #[must_use]
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
+    /// Override the cap on simultaneously open `Extract` streams.
+    #[must_use]
+    pub fn with_max_concurrent_streams(mut self, max: usize) -> Self {
+        self.stream_permits = Arc::new(Semaphore::new(max));
         self
     }
 
@@ -109,10 +154,17 @@ impl LolHtmlGrpc {
     /// backstop fire first for every ordinary overshoot, and the caller would
     /// get `OutOfRange` and a sentence about decoded message lengths instead
     /// of the one telling them what to do.
+    ///
+    /// zstd is enabled in both directions. Responses compress well — match
+    /// events are repetitive small messages — but a response is only ever
+    /// compressed for a client that advertised the encoding, so nothing
+    /// changes for one that did not ask.
     #[must_use]
     pub fn into_service(self) -> pb::lol_html_service_server::LolHtmlServiceServer<Self> {
         let backstop = self.max_chunk_bytes.saturating_mul(2);
         pb::lol_html_service_server::LolHtmlServiceServer::new(self)
+            .accept_compressed(CompressionEncoding::Zstd)
+            .send_compressed(CompressionEncoding::Zstd)
             .max_decoding_message_size(backstop)
     }
 }
@@ -125,6 +177,17 @@ impl pb::lol_html_service_server::LolHtmlService for LolHtmlGrpc {
         &self,
         request: Request<Streaming<pb::ExtractRequest>>,
     ) -> Result<Response<Self::ExtractStream>, Status> {
+        // Held until the stream's driver task ends, so the count of open
+        // streams is the count of live parsers. Fail fast rather than queue:
+        // a caller past the cap needs to know now, not after its upload.
+        let permit = Arc::clone(&self.stream_permits)
+            .try_acquire_owned()
+            .map_err(|_| {
+                Status::resource_exhausted(
+                    "the server is at its concurrent stream limit; retry shortly",
+                )
+            })?;
+
         let mut inbound = request.into_inner();
 
         // The options frame must arrive before anything is parsed, so every
@@ -150,8 +213,18 @@ impl pb::lol_html_service_server::LolHtmlService for LolHtmlGrpc {
         let compiled = rules::compile(&options)?;
         let (tx, rx) = mpsc::channel(OUTBOUND_BUFFER);
         let max_chunk_bytes = self.max_chunk_bytes;
+        let idle_timeout = self.idle_timeout;
 
-        tokio::spawn(async move { drive(inbound, compiled, tx, max_chunk_bytes).await });
+        let span = tracing::info_span!("extract", rules = compiled.rules.len());
+        tokio::spawn(
+            async move {
+                // Moved in so the permit outlives the parse, not just the
+                // call that opened it.
+                let _permit = permit;
+                drive(inbound, compiled, tx, max_chunk_bytes, idle_timeout).await;
+            }
+            .instrument(span),
+        );
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -163,6 +236,24 @@ impl pb::lol_html_service_server::LolHtmlService for LolHtmlGrpc {
         let diagnostics = rules::diagnose(&request.into_inner().rules);
         Ok(Response::new(pb::ValidateSelectorsResponse { diagnostics }))
     }
+
+    async fn get_service_info(
+        &self,
+        _request: Request<pb::GetServiceInfoRequest>,
+    ) -> Result<Response<pb::GetServiceInfoResponse>, Status> {
+        // The UI block is a property of the build, hardcoded to match the
+        // frontend this repo ships, so the shared demo shell can mount it
+        // without any configuration.
+        Ok(Response::new(pb::GetServiceInfoResponse {
+            name: "grpc-lol-html".to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            ui: Some(pb::UiInfo {
+                title: "LOL HTML".to_owned(),
+                path: "/ui/lol-html".to_owned(),
+                description: "Streams CSS-selector matches out of HTML via lol-html".to_owned(),
+            }),
+        }))
+    }
 }
 
 /// Run one document through the rewriter, forwarding events as they occur.
@@ -171,7 +262,9 @@ async fn drive(
     compiled: CompiledOptions,
     tx: mpsc::Sender<Result<pb::ExtractResponse, Status>>,
     max_chunk_bytes: usize,
+    idle_timeout: Duration,
 ) {
+    let started_at = Instant::now();
     let (sink, mut events) = mpsc::unbounded_channel();
     let counters: Vec<Arc<AtomicU64>> = compiled
         .rules
@@ -198,13 +291,34 @@ async fn drive(
     let mut bytes_parsed = 0u64;
 
     loop {
-        let frame = match inbound.message().await {
-            Ok(Some(request)) => request.frame,
-            Ok(None) => break,
+        // An open stream whose client has gone quiet still holds a task and a
+        // parser, so silence is bounded. The timeout is idle, not total: it
+        // resets with every frame, and a document of any length that keeps
+        // sending never trips it.
+        let frame = match tokio::time::timeout(idle_timeout, inbound.message()).await {
+            Ok(Ok(Some(request))) => request.frame,
+            Ok(Ok(None)) => break,
             // The client's own stream failed. There is no useful in-band
             // event for that; propagate the status and stop.
-            Err(status) => {
+            Ok(Err(status)) => {
                 let _ = tx.send(Err(status)).await;
+                return;
+            }
+            // Same shape as the arm above, for the same reason: the error
+            // taxonomy in the contract mirrors lol-html's, and an idle client
+            // is not a parse failure, so this ends the call with a status
+            // rather than an in-band event.
+            Err(_elapsed) => {
+                tracing::warn!(
+                    idle_timeout_ms = idle_timeout.as_millis() as u64,
+                    "client went idle; ending the stream"
+                );
+                let _ = tx
+                    .send(Err(Status::deadline_exceeded(format!(
+                        "no frame received within {} ms; the stream has been closed",
+                        idle_timeout.as_millis()
+                    ))))
+                    .await;
                 return;
             }
         };
@@ -235,15 +349,16 @@ async fn drive(
             return;
         }
 
-        bytes_parsed += chunk.len() as u64;
-
         if let Err(err) = rewriter.write(&chunk) {
             // Events produced before the failure are still valid and were
-            // paid for, so they go out ahead of the error.
+            // paid for, so they go out ahead of the error. The failed chunk
+            // itself is not counted: it was not parsed.
             drain(&mut events, &tx).await;
-            finish_with_error(&tx, &err, &compiled, bytes_parsed, &counters).await;
+            finish_with_error(&tx, &err, &compiled, bytes_parsed, &counters, &started_at).await;
             return;
         }
+
+        bytes_parsed += chunk.len() as u64;
 
         if !drain(&mut events, &tx).await {
             return;
@@ -252,7 +367,7 @@ async fn drive(
 
     if let Err(err) = rewriter.end() {
         drain(&mut events, &tx).await;
-        finish_with_error(&tx, &err, &compiled, bytes_parsed, &counters).await;
+        finish_with_error(&tx, &err, &compiled, bytes_parsed, &counters, &started_at).await;
         return;
     }
 
@@ -260,6 +375,7 @@ async fn drive(
         return;
     }
 
+    let matches = total_matches(&counters);
     let finished = pb::extract_response::Event::Finished(pb::ExtractFinished {
         bytes_parsed,
         matches_by_rule: tally(&compiled, &counters),
@@ -267,6 +383,13 @@ async fn drive(
         bail_out_reason: String::new(),
     });
     send(&tx, finished).await;
+    tracing::info!(
+        bytes_parsed,
+        matches,
+        bailed_out = false,
+        duration_ms = started_at.elapsed().as_millis() as u64,
+        "stream finished"
+    );
 }
 
 /// Close a run that ended in a parse failure.
@@ -281,6 +404,7 @@ async fn finish_with_error(
     compiled: &CompiledOptions,
     bytes_parsed: u64,
     counters: &[Arc<AtomicU64>],
+    started_at: &Instant,
 ) {
     let event = if compiled.graceful_bail_out && errors::is_memory_limit(err) {
         pb::extract_response::Event::Finished(pb::ExtractFinished {
@@ -292,7 +416,21 @@ async fn finish_with_error(
     } else {
         pb::extract_response::Event::Error(errors::stream_error(err))
     };
+    let bailed_out = matches!(&event, pb::extract_response::Event::Finished(_));
     send(tx, event).await;
+    tracing::info!(
+        bytes_parsed,
+        matches = total_matches(counters),
+        bailed_out,
+        error = %err,
+        duration_ms = started_at.elapsed().as_millis() as u64,
+        "stream ended on a parse failure"
+    );
+}
+
+/// Sum every rule's matches into one number, for the log line.
+fn total_matches(counters: &[Arc<AtomicU64>]) -> u64 {
+    counters.iter().map(|c| c.load(Ordering::Relaxed)).sum()
 }
 
 /// Sum per-rule match counts, keyed by rule id.
@@ -572,9 +710,7 @@ fn text_handler(
                 // here, after reassembly — an entity split across fragments
                 // is whole again by this point. Raw mode never reaches this
                 // branch: fragments go out verbatim, as documented.
-                let text = if chunk.text_type().allows_html_entities()
-                    && buffer.contains('&')
-                {
+                let text = if chunk.text_type().allows_html_entities() && buffer.contains('&') {
                     htmlize::unescape(buffer.as_str()).into_owned()
                 } else {
                     std::mem::take(&mut buffer)

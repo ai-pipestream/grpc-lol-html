@@ -6,7 +6,7 @@ rewriter and the engine behind Workers' `HTMLRewriter`.
 
 ```bash
 cargo run --release
-# grpc-lol-html listening on 0.0.0.0:50051 (http2 window 4194304 bytes)
+# INFO grpc_lol_html: grpc-lol-html listening addr=0.0.0.0:50057 window=4194304
 ```
 
 ## What it is
@@ -85,10 +85,30 @@ All optional, read at startup:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `GRPC_LOL_HTML_ADDR` | `0.0.0.0:50051` | listen address |
+| `GRPC_LOL_HTML_ADDR` | `0.0.0.0:50057` | listen address |
 | `GRPC_LOL_HTML_WORKERS` | CPU count | tokio worker threads |
 | `GRPC_LOL_HTML_MAX_CHUNK_BYTES` | 100 MiB | largest inbound chunk accepted |
 | `GRPC_LOL_HTML_WINDOW_BYTES` | 4 MiB | HTTP/2 initial stream and connection window |
+| `GRPC_LOL_HTML_IDLE_TIMEOUT_MS` | 60000 | end an `Extract` stream whose client stops sending |
+| `GRPC_LOL_HTML_MAX_CONCURRENT_STREAMS` | 64 | cap on open `Extract` streams; past it, calls fail with `RESOURCE_EXHAUSTED` |
+
+The idle timeout is idle, not total: it resets with every frame, so a document
+of any length that keeps sending never trips it. A stalled upload gets
+`DEADLINE_EXCEEDED`, not an in-band `error` event — the contract's error
+taxonomy mirrors lol-html's, and a silent client is not a parse failure. The
+stream cap is per-process and per-parser, orthogonal to tonic's per-connection
+`max_concurrent_streams` (1024): each open stream is a parser instance with
+its own buffers, so an unbounded count would be an unbounded memory
+commitment.
+
+Logs go through [tracing](https://docs.rs/tracing): `RUST_LOG` picks the
+filter (default `info`), and at that level each finished stream logs one line
+with its bytes parsed, matches, bail-out flag and duration.
+
+The server also answers the standard gRPC health protocol
+(`grpc.health.v1.Health/Check`): both the empty service name and
+`lolhtml.v1.LolHtmlService` report `SERVING`, so an orchestrator can probe
+the service rather than the port.
 
 ## Where you split the upload is invisible
 
@@ -186,6 +206,10 @@ closes. None of these are pending work.
 sending a document. One cheap round trip, and selector mistakes are the most
 common way to get an empty result out of this service.
 
+`GetServiceInfo` reports the server's name, build version and the shared
+`UiInfo` advertisement the ai-pipestream demo shell reads to mount this
+service's web frontend as a tab.
+
 ## Safety
 
 **Memory is capped whether or not you ask.** lol-html defaults
@@ -241,33 +265,68 @@ the accessor behind its internal `_integration_test` feature. The field number
 is reserved in the proto rather than shipped always-false, so it can come back
 unchanged if that accessor is ever exposed.
 
+## Compression
+
+The server speaks zstd in both directions — it decompresses requests and
+compresses responses — but a response is compressed only for a client that
+advertised the encoding, so nothing changes for one that did not ask. Match
+events are repetitive small messages and compress well.
+
+With tonic, opt in on the client:
+
+```rust
+let mut client = LolHtmlServiceClient::new(channel)
+    .accept_compressed(CompressionEncoding::Zstd) // compressed responses
+    .send_compressed(CompressionEncoding::Zstd); // compressed uploads
+```
+
+(grpcurl's `-encoding` knows gzip only; use a real client for zstd.)
+
 ## Is it fast
 
 Faster over the wire than building a DOM in the same process:
 
 ```
   arm                                best        MiB/s  vs native
-  in-process lol-html               49.3ms          324      1.00x
-  over gRPC                        129.7ms          123      2.63x
-  scraper (html5ever + DOM)        168.1ms           95      3.41x
+  in-process lol-html               41.2ms          389      1.00x
+  over gRPC                         89.8ms          178      2.18x
+  scraper (html5ever + DOM)        144.3ms          111      3.50x
 ```
 
 16 MiB synthetic page, 135,426 matched elements, 7 interleaved iterations on a
-32 core host. You pay about 2.6x against in-process lol-html for serialization
+32 core host. You pay about 2.2x against in-process lol-html for serialization
 and a socket, and still beat html5ever with a DOM, which pays no transport cost
 at all. Ratios are unchanged at 64 MiB.
 
 `bench/` refuses to print numbers unless the arms agree: every matched element
 folds into an order-sensitive digest, and in-process and over-the-wire must be
-byte-identical. Use 256 KiB upload chunks; throughput plateaus there and buys
-nothing above 1 MiB. See [bench/RESULTS.md](bench/RESULTS.md), including two
-hypotheses about where the cost goes that turned out to be wrong.
+byte-identical. Chunk size matters less than it used to: everything from
+16 KiB to 1 MiB lands within run-to-run variance, and clients that can buffer
+the document whole measure fastest of all. See
+[bench/RESULTS.md](bench/RESULTS.md), including two hypotheses about where the
+cost goes that turned out to be wrong.
+
+## Docker
+
+```bash
+docker build -t grpc-lol-html .
+docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+  -p 50057:50057 grpc-lol-html
+```
+
+The build stage runs the test suite and then compiles with fat LTO and
+`panic = "abort"`; a red suite fails the image rather than shipping. The
+runtime is `dhi.io/debian-base:trixie-debian13` and runs as a non-root user
+with no shell, which is why
+health checking is the orchestrator's job over `grpc.health.v1.Health/Check`
+rather than a Dockerfile `HEALTHCHECK`. Codegen is checked in, so the build
+needs neither buf nor protoc.
 
 ## Building
 
 ```bash
 cargo build --release
-cargo test                                              # 43 tests
+cargo test                                              # 48 tests
 cargo clippy --all-targets --all-features -- -Dwarnings
 buf lint && buf build
 buf generate                                            # regenerate src/gen
@@ -279,7 +338,7 @@ The server also exposes gRPC reflection (v1) from a `FileDescriptorSet` checked
 in at `src/gen/file_descriptor_set.binpb`: the same `buf build` output, kept
 next to the generated Rust since codegen runs through buf rather than a
 build.rs. Rebuild it after any proto change; with it, clients such as
-`grpcurl -plaintext localhost:50051 list` need no local .proto files.
+`grpcurl -plaintext localhost:50057 list` need no local .proto files.
 
 MSRV is 1.88, set by tonic 0.14 rather than by lol-html, which builds on 1.85.
 

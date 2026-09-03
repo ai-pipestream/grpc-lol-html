@@ -8,7 +8,7 @@ cargo run --release -- --file page.html              # a real page
 cargo run --release -- --mib 64 --iterations 7
 cargo run --release -- --selectors "a[href],h2"      # vary the match count
 cargo run --release -- --chunk 1048576               # vary the upload chunk
-LOL_HTML_ADDR=10.0.0.5:50051 cargo run --release     # measure across a network
+LOL_HTML_ADDR=10.0.0.5:50057 cargo run --release     # measure across a network
 ```
 
 Its own crate with a path dependency back on the server, so it provably links

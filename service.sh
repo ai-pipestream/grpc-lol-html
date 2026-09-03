@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$SCRIPT_DIR/target/release/grpc-lol-html"
 PID_FILE="$SCRIPT_DIR/run/grpc-lol-html.pid"
 LOG_FILE="$SCRIPT_DIR/logs/grpc-lol-html.log"
-ADDR="${GRPC_LOL_HTML_ADDR:-0.0.0.0:50051}"
+ADDR="${GRPC_LOL_HTML_ADDR:-0.0.0.0:50057}"
 
 running_pid() {
   # Prints the live pid, or nothing. A stale pid file is removed.

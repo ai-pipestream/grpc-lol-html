@@ -52,11 +52,18 @@ const FIXTURES: &[(&str, &str)] = &[
 /// Start the server on an ephemeral localhost port and return a connected
 /// client.
 async fn start_server() -> LolHtmlServiceClient<Channel> {
+    start_configured_server(LolHtmlGrpc::new().into_service()).await
+}
+
+/// Start a pre-configured service on an ephemeral localhost port and return a
+/// connected client.
+async fn start_configured_server(
+    service: pb::lol_html_service_server::LolHtmlServiceServer<LolHtmlGrpc>,
+) -> LolHtmlServiceClient<Channel> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().unwrap();
-    let service = LolHtmlGrpc::new().into_service();
     tokio::spawn(async move {
         Server::builder()
             .add_service(service)
@@ -398,7 +405,10 @@ async fn entities_are_decoded_in_data_and_rcdata_text() {
         .iter()
         .find(|t| t.rule_id == "case")
         .expect("p#case text");
-    assert_eq!(case.text, "Byrd & Davis, “curly” quotes, <escaped tag>, café.");
+    assert_eq!(
+        case.text,
+        "Byrd & Davis, “curly” quotes, <escaped tag>, café."
+    );
 
     let title = texts
         .iter()
@@ -1354,24 +1364,12 @@ async fn every_reachable_selector_error_code_has_a_selector_that_triggers_it() {
 /// size: overshoot the cap and our error is the one that speaks.
 #[tokio::test]
 async fn an_oversized_chunk_is_refused_by_the_server_not_the_transport() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let service = LolHtmlGrpc::new()
-        .with_max_chunk_bytes(64 * 1024)
-        .into_service();
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(service)
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-            .expect("server failed");
-    });
-    let channel = Endpoint::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .expect("connect");
-    let client = LolHtmlServiceClient::new(channel);
+    let client = start_configured_server(
+        LolHtmlGrpc::new()
+            .with_max_chunk_bytes(64 * 1024)
+            .into_service(),
+    )
+    .await;
 
     // Over the 64 KiB cap, under the 128 KiB transport backstop.
     let oversized = vec![b'x'; 96 * 1024];
@@ -1388,5 +1386,181 @@ async fn an_oversized_chunk_is_refused_by_the_server_not_the_transport() {
         err.message().contains("exceeds") && err.message().contains("smaller chunks"),
         "the error should say what to do: {}",
         err.message()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Compression
+// ---------------------------------------------------------------------------
+
+/// A client that asks for zstd gets a working stream; one that sends
+/// zstd-compressed frames is understood. If either direction were unwired the
+/// round trip would fail at the transport with `Unimplemented`.
+#[tokio::test]
+async fn zstd_compression_round_trips_in_both_directions() {
+    let client = start_server().await;
+    let mut client = client
+        .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+        .send_compressed(tonic::codec::CompressionEncoding::Zstd);
+
+    let mut stream = client
+        .extract(tokio_stream::iter(vec![
+            pb::ExtractRequest {
+                frame: Some(pb::extract_request::Frame::Options(pb::ExtractOptions {
+                    rules: vec![rule("p", "p")],
+                    ..Default::default()
+                })),
+            },
+            pb::ExtractRequest {
+                frame: Some(pb::extract_request::Frame::Chunk(
+                    b"<p>compressed</p>".to_vec(),
+                )),
+            },
+        ]))
+        .await
+        .expect("a compressed call should open")
+        .into_inner();
+
+    let mut saw_finished = false;
+    while let Some(event) = stream.message().await.unwrap() {
+        if matches!(event.event, Some(Event::Finished(_))) {
+            saw_finished = true;
+        }
+    }
+    assert!(
+        saw_finished,
+        "the compressed stream should close with `finished`"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stream lifecycle limits
+// ---------------------------------------------------------------------------
+
+/// A client that sends its options and then goes quiet loses the stream.
+///
+/// The idle timeout bounds how long a stalled upload can pin a parser. It is
+/// idle, not total: a document of any length that keeps sending never trips
+/// it, so the test stalls *between* frames and expects the call to end with
+/// `DEADLINE_EXCEEDED` rather than an in-band error — the contract's error
+/// taxonomy mirrors lol-html's, and a silent client is not a parse failure.
+#[tokio::test]
+async fn a_stalled_upload_is_ended_with_deadline_exceeded() {
+    let mut client = start_configured_server(
+        LolHtmlGrpc::new()
+            .with_idle_timeout(std::time::Duration::from_millis(200))
+            .into_service(),
+    )
+    .await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    tx.send(pb::ExtractRequest {
+        frame: Some(pb::extract_request::Frame::Options(pb::ExtractOptions {
+            rules: vec![rule("p", "p")],
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    tx.send(pb::ExtractRequest {
+        frame: Some(pb::extract_request::Frame::Chunk(b"<p>hi</p>".to_vec())),
+    })
+    .await
+    .unwrap();
+
+    let mut stream = client
+        .extract(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .expect("open the call")
+        .into_inner();
+
+    // The first chunk's events arrive normally; then the client says nothing
+    // and the server has to be the one to end it. `tx` is held open for the
+    // whole loop so the silence is the client's choice, not a half-close.
+    let mut error = None;
+    loop {
+        match stream.message().await {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(status) => {
+                error = Some(status);
+                break;
+            }
+        }
+    }
+    drop(tx);
+
+    assert_eq!(
+        error.map(|status| status.code()),
+        Some(Code::DeadlineExceeded),
+        "an idle client should be cut loose with DEADLINE_EXCEEDED"
+    );
+}
+
+/// Past the concurrent-stream cap, a call is refused before a byte is read.
+#[tokio::test]
+async fn streams_past_the_concurrency_cap_fail_fast() {
+    let mut client = start_configured_server(
+        LolHtmlGrpc::new()
+            .with_max_concurrent_streams(1)
+            .into_service(),
+    )
+    .await;
+
+    // The first call opens and stays open, holding the one permit.
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    tx.send(pb::ExtractRequest {
+        frame: Some(pb::extract_request::Frame::Options(everything())),
+    })
+    .await
+    .unwrap();
+    let mut first = client
+        .extract(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .expect("the first call opens")
+        .into_inner();
+    assert!(matches!(
+        first.message().await.unwrap().unwrap().event,
+        Some(Event::Started(_))
+    ));
+
+    // The second is refused as a status on the call, before its options are
+    // even read.
+    let err = client
+        .extract(tokio_stream::iter(vec![pb::ExtractRequest {
+            frame: Some(pb::extract_request::Frame::Options(everything())),
+        }]))
+        .await
+        .expect_err("a call past the cap should be refused");
+    assert_eq!(err.code(), Code::ResourceExhausted);
+
+    // Once the first stream is gone the permit comes back, so a retry works.
+    // The release happens in the driver task, hence the brief grace period.
+    drop(first);
+    drop(tx);
+    let mut reopened = None;
+    for _ in 0..50 {
+        match client
+            .extract(tokio_stream::iter(vec![
+                pb::ExtractRequest {
+                    frame: Some(pb::extract_request::Frame::Options(everything())),
+                },
+                pb::ExtractRequest {
+                    frame: Some(pb::extract_request::Frame::Chunk(b"<p>back</p>".to_vec())),
+                },
+            ]))
+            .await
+        {
+            Ok(response) => {
+                reopened = Some(response);
+                break;
+            }
+            Err(status) => assert_eq!(status.code(), Code::ResourceExhausted),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        reopened.is_some(),
+        "the permit should be released when the first stream ends"
     );
 }

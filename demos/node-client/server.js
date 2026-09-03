@@ -15,7 +15,8 @@
 //
 //   node server.js            # http://127.0.0.1:8080
 //
-// Environment: LOL_HTML_ADDR (default 127.0.0.1:50051), PORT (default 8080).
+// Environment: LOL_HTML_ADDR (default 127.0.0.1:50057), PORT (default 8080),
+// UI_BASE (default empty; serve everything under this path prefix instead).
 
 import { createServer } from "node:http";
 import { readFile, readdir, stat } from "node:fs/promises";
@@ -24,9 +25,22 @@ import path from "node:path";
 import { LolHtmlClient } from "./lib/lolhtml.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
-const ADDR = process.env.LOL_HTML_ADDR ?? "127.0.0.1:50051";
+const ADDR = process.env.LOL_HTML_ADDR ?? "127.0.0.1:50057";
 const client = new LolHtmlClient(ADDR);
 const publicDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "public");
+
+/**
+ * Path prefix the whole bridge is served under, e.g. `/ui/lol-html` behind a
+ * reverse proxy that forwards without stripping. Empty means the bridge
+ * answers at the root, byte-for-byte as it always has.
+ */
+const UI_BASE = normalizeBase(process.env.UI_BASE ?? "");
+
+function normalizeBase(base) {
+  if (!base) return "";
+  const withSlash = base.startsWith("/") ? base : `/${base}`;
+  return withSlash.replace(/\/+$/, "");
+}
 
 /** Largest artificial upload delay accepted, in ms per chunk. */
 const MAX_DELAY_MS = 2000;
@@ -210,12 +224,18 @@ async function bridge(req, res, url) {
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  // The router sees the path with the base stripped, so every route below is
+  // written against the root and works identically with or without UI_BASE.
+  let pathname = url.pathname;
+  if (UI_BASE && (pathname === UI_BASE || pathname.startsWith(`${UI_BASE}/`))) {
+    pathname = pathname.slice(UI_BASE.length) || "/";
+  }
   try {
-    if (req.method === "POST" && url.pathname === "/api/extract") {
+    if (req.method === "POST" && pathname === "/api/extract") {
       return await bridge(req, res, url);
     }
 
-    if (req.method === "GET" && url.pathname === "/api/samples") {
+    if (req.method === "GET" && pathname === "/api/samples") {
       return sendJson(res, 200, { files: await listSamples() });
     }
 
@@ -223,7 +243,7 @@ const server = createServer(async (req, res) => {
     // then checked to be inside the sample directory rather than pattern
     // matched. Prefix checks on unresolved strings are how directory
     // traversal gets through.
-    const sample = url.pathname.match(/^\/api\/samples\/(.+)$/);
+    const sample = pathname.match(/^\/api\/samples\/(.+)$/);
     if (req.method === "GET" && sample) {
       const file = path.resolve(sampleDir, decodeURIComponent(sample[1]));
       if (!file.startsWith(sampleDir + path.sep)) {
@@ -238,16 +258,20 @@ const server = createServer(async (req, res) => {
     }
 
     // Static front end. no-store: this is a live demo page, never let the
-    // browser run a stale copy of it.
-    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-      const html = await readFile(path.join(publicDir, "index.html"));
+    // browser run a stale copy of it. When a base is configured the page is
+    // told about it through a meta tag, and prefixes its own calls with it.
+    if (req.method === "GET" && (pathname === "/" || pathname === "/index.html")) {
+      let html = await readFile(path.join(publicDir, "index.html"), "utf8");
+      if (UI_BASE) {
+        html = html.replace("</head>", `<meta name="ui-base" content="${UI_BASE}">\n</head>`);
+      }
       res.writeHead(200, {
         "content-type": "text/html; charset=utf-8",
         "cache-control": "no-store",
       });
       return res.end(html);
     }
-    if (req.method === "GET" && url.pathname === "/favicon.ico") {
+    if (req.method === "GET" && pathname === "/favicon.ico") {
       res.writeHead(204);
       return res.end();
     }

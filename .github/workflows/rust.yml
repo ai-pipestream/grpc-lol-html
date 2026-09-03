@@ -45,7 +45,10 @@ jobs:
   proto:
     runs-on: ubuntu-24.04
     steps:
+    # Full history: `buf breaking` compares against origin/master.
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - uses: bufbuild/buf-action@v1
       with:
         setup_only: true
@@ -53,3 +56,23 @@ jobs:
       run: |
         buf lint
         buf build
+    - name: Breaking changes against master
+      run: |
+        buf breaking --against '.git#branch=origin/master'
+    # The generated Rust under src/gen is checked in (there is no build.rs),
+    # so CI proves it still matches the proto rather than trusting a human to
+    # have regenerated it. The plugin versions are pinned because a different
+    # plugin produces a different file for the same proto.
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+          toolchain: stable
+    - name: Install codegen plugins
+      run: |
+        cargo install protoc-gen-prost --version 0.5.0 --locked
+        cargo install protoc-gen-tonic --version 0.5.0 --locked
+    - name: Checked-in codegen is fresh
+      run: |
+        buf generate
+        buf build -o src/gen/file_descriptor_set.binpb
+        git diff --exit-code src/gen/
