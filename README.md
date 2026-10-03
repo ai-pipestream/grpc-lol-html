@@ -102,7 +102,7 @@ naming the variable, rather than falling back to the default:
 | `GRPC_LOL_HTML_WORKERS` | CPU count | tokio worker threads |
 | `GRPC_LOL_HTML_MAX_CHUNK_BYTES` | 100 MiB | largest inbound chunk accepted |
 | `GRPC_LOL_HTML_WINDOW_BYTES` | 4 MiB | HTTP/2 initial stream and connection window |
-| `GRPC_LOL_HTML_IDLE_TIMEOUT_MS` | 60000 | end an `Extract` stream whose client stops sending |
+| `GRPC_LOL_HTML_IDLE_TIMEOUT_MS` | 60000 | end an `Extract` stream whose client stops sending, or never sends its options frame |
 | `GRPC_LOL_HTML_UPLOAD_TIMEOUT_MS` | 600000 | end an `Extract` stream whose upload takes longer than this in all |
 | `GRPC_LOL_HTML_SEND_TIMEOUT_MS` | 60000 | end an `Extract` stream whose client stops reading |
 | `GRPC_LOL_HTML_OUTBOUND_BUFFER_BYTES` | 8 MiB | unsent events one stream may hold before the parse waits for its client |
@@ -110,7 +110,10 @@ naming the variable, rather than falling back to the default:
 | `GRPC_LOL_HTML_MAX_CONCURRENT_STREAMS` | 64 | cap on open `Extract` streams; past it, calls fail with `RESOURCE_EXHAUSTED` |
 
 The idle timeout is idle, not total: it resets with every chunk that carries
-document bytes, so a long document that keeps sending never trips it. Empty
+document bytes, so a long document that keeps sending never trips it. It
+also bounds the wait for the options frame, which starts once the call holds
+a stream slot (the upload timeout does instead, if it is shorter), so clients
+that open calls and send nothing cannot hold every slot. Empty
 frames and empty chunks do not reset it, or a client could hold a stream open
 for ever by sending nothing. The upload timeout is the total: the whole upload,
 from the options frame to the half-close and including any time the parse
@@ -232,6 +235,9 @@ that into a standoff once the output outgrows the buffer: its upload blocks on
 a full HTTP/2 window and it never gets to the read that would unblock it.
 After the send timeout the server gives up, keeps reading the upload so the
 client can finish it, and answers the first read with `RESOURCE_EXHAUSTED`.
+A parse that ends before the upload does, on an in-band error or a graceful
+bail-out, is different: the server reads and drops the rest of the upload at
+once, so the client finishes it and reads the real result.
 Small outputs fit in the buffer and work anyway, which is what makes this easy
 to ship. Read on a second thread, or with an async or callback API, the same
 as any bidirectional stream.
@@ -290,8 +296,10 @@ text beside it. A preallocation larger than the limit is cut to it.
 reassembled text: the memory limit each. Unsent events: the outbound buffer,
 8 MiB per stream, with the parse waiting on the client beyond that, and the
 call ended after the send timeout if the client takes nothing. One event
-larger than the whole buffer still goes out, alone, so a single text node can
-take the buffer past its bound up to the memory limit. One inbound chunk: the
+larger than the whole buffer still goes out, alone, charged as if it filled
+the buffer exactly, so the real bound is the larger of the buffer and the
+largest single event: a reassembled text node or one huge attribute value can
+take a stream's queue up to the memory limit (64 MiB by default), not 8 MiB. One inbound chunk: the
 chunk cap. The work and the output per element: at most 256 rules, with ids
 of at most 256 bytes and selectors of at most 4096. So a stream's memory has a
 ceiling set by configuration, and the process's by that times the stream cap;

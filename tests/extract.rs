@@ -1795,6 +1795,154 @@ async fn a_client_that_reads_only_after_uploading_gets_resource_exhausted_not_a_
     );
 }
 
+/// A client that reads only after uploading still gets the real result of a
+/// parse that ended early, and gets it without waiting.
+///
+/// A parse that ends partway through the upload, here on a text node over
+/// the memory limit, with more output queued than the transport will take
+/// from a client that is not reading, used to stop reading the upload until
+/// the send timeout passed. The client, blocked on its write, never got to
+/// its read, so the in-band error or the bail-out was thrown away and
+/// replaced by `RESOURCE_EXHAUSTED` a send timeout later. Now the rest of the
+/// upload is read and dropped while the result waits.
+#[tokio::test]
+async fn an_early_ending_reaches_a_client_that_reads_only_after_uploading() {
+    let send_timeout = std::time::Duration::from_secs(5);
+    let client = start_server_with_client_window(
+        LolHtmlGrpc::new()
+            .with_outbound_buffer_bytes(64 << 20)
+            .with_send_timeout(send_timeout)
+            .into_service(),
+        64 * 1024,
+    )
+    .await;
+
+    // Fifty thousand void elements, far more output than the client's window
+    // and the transport's buffers hold, then a text node that outgrows the
+    // 64 KiB limit, then megabytes more: several times the server's receive
+    // window, which can only be sent if the server keeps reading after the
+    // parse has ended.
+    let images = 50_000;
+    let mut document = b"<img x=\"1\">".repeat(images);
+    document.extend_from_slice(b"<p>");
+    document.extend("word ".repeat(1 << 20).bytes());
+
+    for graceful_bail_out in [false, true] {
+        let mut options = paragraph_text(pb::MemoryLimits {
+            graceful_bail_out,
+            ..Default::default()
+        });
+        options.rules.push(pb::ExtractRule {
+            id: "img".to_owned(),
+            selector: "img".to_owned(),
+            captures: vec![pb::Capture::TagName as i32, pb::Capture::Attributes as i32],
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(options_frame(options)).await.unwrap();
+        let started = std::time::Instant::now();
+        let mut stream = client
+            .clone()
+            .extract(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .expect("open the call")
+            .into_inner();
+
+        // Chunks well inside the memory limit, which the parser's own input
+        // buffer counts against.
+        let chunks = document.clone();
+        let upload = async move {
+            for chunk in chunks.chunks(16 * 1024) {
+                tx.send(chunk_frame(chunk)).await.unwrap();
+            }
+        };
+        tokio::time::timeout(send_timeout / 2, upload)
+            .await
+            .expect("the upload must be able to finish after the parse has ended");
+
+        let mut events = Vec::new();
+        while let Some(event) = stream
+            .message()
+            .await
+            .unwrap_or_else(|status| panic!("bail out {graceful_bail_out}: {status:?}"))
+        {
+            events.push(event);
+        }
+        assert!(
+            started.elapsed() < send_timeout,
+            "the result took {:?}",
+            started.elapsed()
+        );
+        let delivered = only!(events, Event::Element)
+            .iter()
+            .filter(|element| element.rule_id == "img")
+            .count();
+        assert_eq!(delivered, images, "every queued event still goes out");
+        if graceful_bail_out {
+            let finished = only!(events, Event::Finished);
+            assert_eq!(finished.len(), 1);
+            assert!(finished[0].bailed_out);
+        } else {
+            let errors = only!(events, Event::Error);
+            assert_eq!(errors.len(), 1);
+            assert_eq!(
+                errors[0].code,
+                pb::ParseErrorCode::MemoryLimitExceeded as i32,
+                "{}",
+                errors[0].message
+            );
+        }
+    }
+}
+
+/// A call that never sends its options frame does not hold its stream slot
+/// past the idle timeout.
+///
+/// The slot is taken before the options frame is read, and that read used
+/// to have no deadline, so clients that opened calls and sent nothing could
+/// hold every slot for as long as they liked.
+#[tokio::test]
+async fn a_call_that_never_sends_options_gives_its_slot_back() {
+    let client = start_configured_server(
+        LolHtmlGrpc::new()
+            .with_max_concurrent_streams(1)
+            .with_idle_timeout(std::time::Duration::from_millis(300))
+            .into_service(),
+    )
+    .await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<pb::ExtractRequest>(1);
+    let silent = {
+        let mut client = client.clone();
+        tokio::spawn(async move {
+            client
+                .extract(tokio_stream::wrappers::ReceiverStream::new(rx))
+                .await
+        })
+    };
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), silent)
+        .await
+        .expect("a silent call should be ended by the server")
+        .unwrap()
+        .expect_err("a call with no options frame cannot open");
+    assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+    assert!(
+        status.message().contains("options"),
+        "the status should say what was missing: {}",
+        status.message()
+    );
+    drop(tx);
+
+    // The only slot is free again.
+    let events = extract(&client, b"<a x=\"1\">", every_anchor(), 64)
+        .await
+        .expect("the slot should be free once the silent call has ended");
+    assert!(matches!(
+        events.last().and_then(|e| e.event.as_ref()),
+        Some(Event::Finished(_))
+    ));
+}
+
 /// A client that never reads does not get to keep its stream slot.
 ///
 /// With room for one stream, a second client's call is refused while the

@@ -85,7 +85,9 @@ pub const DEFAULT_MAX_CHUNK_BYTES: usize = 100 * 1024 * 1024;
 /// server task forever; this is the bound on that. Sixty seconds is generous
 /// for a protocol whose only reason to pause is a slow upstream of its own.
 /// Frames that carry nothing, empty frames and empty chunks, do not count:
-/// a client could otherwise keep a stream open for ever by sending them.
+/// a client could otherwise keep a stream open for ever by sending them. It
+/// also bounds the wait for the options frame, which starts once the call
+/// holds its stream slot (or the upload timeout, if that is shorter).
 pub const DEFAULT_IDLE_TIMEOUT_MS: usize = 60_000;
 
 /// Default for how long an `Extract` stream's upload may take in all, in
@@ -118,8 +120,13 @@ pub const DEFAULT_SEND_TIMEOUT_MS: usize = 60_000;
 ///
 /// A client that reads while it uploads never comes near it. It is what an
 /// upload-then-read client gets before backpressure, and then the send
-/// timeout, applies: 8 MiB holds the whole output of most pages, and bounds
-/// what the default 64 streams can hold at 512 MiB.
+/// timeout, applies: 8 MiB holds the whole output of most pages.
+///
+/// The bound is the larger of this and the largest single event, not this
+/// alone: an event larger than the whole buffer is let through on its own,
+/// charged as if it filled the buffer exactly. One reassembled text node or
+/// one huge attribute value can be as large as the call's memory limit, so a
+/// stream's queue can hold up to that, and 64 streams up to 64 times it.
 pub const DEFAULT_OUTBOUND_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 /// Default ceiling on the memory limit a call may ask for, in bytes.
@@ -273,7 +280,20 @@ impl pb::lol_html_service_server::LolHtmlService for LolHtmlGrpc {
         // way the request can be rejected is resolved here, as a status on
         // the call. Once the stream opens, only a parse failure can end it
         // badly, and that arrives in-band.
-        let options = match inbound.message().await? {
+        //
+        // The slot is already held, so the wait for it is bounded like any
+        // other silence on the upload: a client that opens calls and sends
+        // nothing would otherwise hold every slot for as long as it liked.
+        let first_frame_timeout = self.idle_timeout.min(self.upload_timeout);
+        let first = tokio::time::timeout(first_frame_timeout, inbound.message())
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "no `options` frame received within {} ms; the stream has been closed",
+                    first_frame_timeout.as_millis()
+                ))
+            })?;
+        let options = match first? {
             Some(pb::ExtractRequest {
                 frame: Some(pb::extract_request::Frame::Options(options)),
             }) => options,
@@ -308,10 +328,19 @@ impl pb::lol_html_service_server::LolHtmlService for LolHtmlGrpc {
                 // taken nothing for the send timeout and they are thrown
                 // away. Released any earlier, a client that never reads
                 // could leave a full queue behind for every slot it cycles
-                // through.
-                if matches!(ending, Ending::Complete | Ending::Early)
-                    && outbound.delivered(limits.send_timeout).await == Delivery::Stalled
-                {
+                // through. After an early ending the rest of the upload is
+                // read and dropped meanwhile: a client that reads only once
+                // it has finished uploading would otherwise sit blocked on
+                // its write for the whole send timeout and then get the
+                // timeout's status in place of its result.
+                let delivery = match ending {
+                    Ending::Complete => Some(outbound.delivered(limits.send_timeout).await),
+                    Ending::Early => {
+                        Some(delivered_draining(&mut inbound, &outbound, limits).await)
+                    }
+                    Ending::NotReading | Ending::Gone => None,
+                };
+                if delivery == Some(Delivery::Stalled) {
                     tracing::warn!(
                         queued_bytes = outbound.queued_bytes(),
                         send_timeout_ms = limits.send_timeout.as_millis() as u64,
@@ -687,6 +716,30 @@ async fn discard_upload(
                 if !matches!(frame, Ok(Ok(Some(_)))) {
                     return;
                 }
+            }
+        }
+    }
+}
+
+/// Wait for the terminal item to be delivered, reading and dropping the rest
+/// of the upload meanwhile.
+///
+/// Unlike [`discard_upload`], an upload that ends, fails or goes idle only
+/// stops the reading, not the wait: the result is still owed to the client,
+/// and the send timeout still bounds how long it has to take it.
+async fn delivered_draining(
+    inbound: &mut Streaming<pb::ExtractRequest>,
+    outbound: &Outbound,
+    limits: Limits,
+) -> Delivery {
+    let delivered = outbound.delivered(limits.send_timeout);
+    tokio::pin!(delivered);
+    let mut uploading = true;
+    loop {
+        tokio::select! {
+            delivery = &mut delivered => return delivery,
+            frame = tokio::time::timeout(limits.idle_timeout, inbound.message()), if uploading => {
+                uploading = matches!(frame, Ok(Ok(Some(_))));
             }
         }
     }

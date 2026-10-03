@@ -16,8 +16,8 @@
 //! - `GRPC_LOL_HTML_WINDOW_BYTES` — HTTP/2 initial stream and connection
 //!   window (default: 4 MiB).
 //! - `GRPC_LOL_HTML_IDLE_TIMEOUT_MS` — how long an open `Extract` stream may
-//!   go without an inbound chunk carrying document bytes before the server
-//!   ends it (default: 60000).
+//!   go without an inbound chunk carrying document bytes, or wait for its
+//!   options frame, before the server ends it (default: 60000).
 //! - `GRPC_LOL_HTML_UPLOAD_TIMEOUT_MS` — how long an `Extract` stream's whole
 //!   upload may take before the server ends it (default: 600000).
 //! - `GRPC_LOL_HTML_SEND_TIMEOUT_MS` — how long an open `Extract` stream may

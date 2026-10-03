@@ -414,9 +414,11 @@ impl Outbound {
     /// End the call with `status` now, discarding everything still queued,
     /// including what the stream has taken but not yet handed over.
     ///
-    /// A failure status that is already queued is kept rather than replaced,
-    /// because it is the more specific of the two. Does nothing once the
-    /// terminal item has been delivered.
+    /// A failure that is already queued, a status or an in-band `error`
+    /// event, is kept rather than replaced, because it is the more specific
+    /// of the two. A queued `finished` is not: with the events ahead of it
+    /// discarded it would pass a partial result off as a whole one. Does
+    /// nothing once the terminal item has been delivered.
     pub fn abort(&self, status: Status) {
         let mut batch = self.shared.lock_batch();
         let mut state = self.shared.lock();
@@ -425,9 +427,9 @@ impl Outbound {
         }
         // Nothing follows a terminal item, so a queued failure is the last
         // thing in the queue or, if the stream has taken it, in the batch.
-        let kept = if matches!(state.queue.back(), Some(Queued { item: Err(_), .. })) {
+        let kept = if state.queue.back().is_some_and(|q| is_failure(&q.item)) {
             state.queue.pop_back()
-        } else if matches!(batch.items.back(), Some(Queued { item: Err(_), .. })) {
+        } else if batch.items.back().is_some_and(|q| is_failure(&q.item)) {
             batch.items.pop_back()
         } else {
             None
@@ -662,6 +664,18 @@ impl Drop for OutboundStream {
             self.shared.progress.notify_one();
         }
     }
+}
+
+/// Whether `item` ends the call as a failure: a status, or an in-band
+/// `error` event.
+const fn is_failure(item: &Item) -> bool {
+    matches!(
+        item,
+        Err(_)
+            | Ok(pb::ExtractResponse {
+                event: Some(pb::extract_response::Event::Error(_)),
+            })
+    )
 }
 
 /// Whether an item ends the response stream.
@@ -954,6 +968,37 @@ mod tests {
 
         let status = rx.next().await.unwrap().unwrap_err();
         assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+    }
+
+    #[tokio::test]
+    async fn an_abort_keeps_an_in_band_error_that_was_already_queued() {
+        let (tx, mut rx) = channel(1 << 20);
+        tx.send_blocking(text("queued"), Duration::from_secs(1))
+            .unwrap();
+        tx.push(pb::extract_response::Event::Error(
+            pb::StreamError::default(),
+        ));
+        tx.abort(Status::resource_exhausted("not reading"));
+
+        assert!(matches!(
+            rx.next().await,
+            Some(Ok(pb::ExtractResponse {
+                event: Some(pb::extract_response::Event::Error(_)),
+            }))
+        ));
+        assert!(rx.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_abort_replaces_a_finished_whose_events_it_discards() {
+        let (tx, mut rx) = channel(1 << 20);
+        tx.send_blocking(text("queued"), Duration::from_secs(1))
+            .unwrap();
+        tx.push(finished());
+        tx.abort(Status::resource_exhausted("not reading"));
+
+        let status = rx.next().await.unwrap().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
     }
 
     /// One event bigger than the whole queue still goes out, alone.
