@@ -2015,3 +2015,124 @@ async fn a_preallocation_over_the_memory_limit_does_not_break_the_call() {
         );
     }
 }
+
+/// Options capturing the text of every `<p>` under a 64 KiB memory limit.
+fn paragraph_text(limits: pb::MemoryLimits) -> pb::ExtractOptions {
+    pb::ExtractOptions {
+        rules: vec![pb::ExtractRule {
+            id: "p".to_owned(),
+            selector: "p".to_owned(),
+            captures: vec![pb::Capture::Text as i32],
+        }],
+        limits: Some(pb::MemoryLimits {
+            max_bytes: 64 * 1024,
+            ..limits
+        }),
+        ..Default::default()
+    }
+}
+
+/// Text is reassembled into whole nodes before it is sent, and the text held
+/// meanwhile counts against the call's memory limit, which lol-html's own
+/// accounting never sees. One long text node used to grow the server without
+/// bound; now it ends the run the way any memory-limit overrun does.
+#[tokio::test]
+async fn a_text_node_longer_than_the_memory_limit_ends_the_run_in_band() {
+    let client = start_server().await;
+    let text = "word ".repeat(200_000);
+    let document = format!("<p>{text}</p><p>after</p>");
+
+    let events = extract(
+        &client,
+        document.as_bytes(),
+        paragraph_text(pb::MemoryLimits::default()),
+        16 * 1024,
+    )
+    .await
+    .expect("the call itself succeeds");
+    let errors = only!(events, Event::Error);
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].code,
+        pb::ParseErrorCode::MemoryLimitExceeded as i32,
+        "{}",
+        errors[0].message
+    );
+    assert!(
+        errors[0].message.contains("raw_text_chunks"),
+        "the error should name the way out: {}",
+        errors[0].message
+    );
+    assert!(
+        only!(events, Event::Text).is_empty(),
+        "no piece of the node may be passed off as the whole of it"
+    );
+
+    // Graceful bail-out turns it into a truncated success that says so.
+    let events = extract(
+        &client,
+        document.as_bytes(),
+        paragraph_text(pb::MemoryLimits {
+            graceful_bail_out: true,
+            ..Default::default()
+        }),
+        16 * 1024,
+    )
+    .await
+    .expect("the call itself succeeds");
+    let finished = only!(events, Event::Finished);
+    assert_eq!(finished.len(), 1);
+    assert!(finished[0].bailed_out);
+    assert!(finished[0].bail_out_reason.contains("reassembled"));
+
+    // Raw fragments are never held, so the same node streams through whole.
+    let events = extract(
+        &client,
+        document.as_bytes(),
+        pb::ExtractOptions {
+            raw_text_chunks: true,
+            ..paragraph_text(pb::MemoryLimits::default())
+        },
+        16 * 1024,
+    )
+    .await
+    .expect("the call itself succeeds");
+    let fragments = only!(events, Event::Text);
+    let end = fragments
+        .iter()
+        .position(|fragment| fragment.last_in_node)
+        .expect("the first node ends");
+    let first: String = fragments[..=end].iter().map(|f| f.text.as_str()).collect();
+    assert_eq!(first, text);
+    let finished = only!(events, Event::Finished);
+    assert!(!finished[0].bailed_out);
+}
+
+/// The limit is on the text held across all of a call's rules, not per
+/// rule: two rules capturing the same node hold it twice.
+#[tokio::test]
+async fn text_held_for_reassembly_is_counted_across_rules() {
+    let client = start_server().await;
+    let document = format!("<p>{}</p>", "x".repeat(40 * 1024));
+
+    let one_rule = paragraph_text(pb::MemoryLimits::default());
+    let events = extract(&client, document.as_bytes(), one_rule.clone(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(only!(events, Event::Text).len(), 1, "40 KiB fits in 64 KiB");
+
+    let mut two_rules = one_rule;
+    two_rules.rules.push(pb::ExtractRule {
+        id: "again".to_owned(),
+        ..two_rules.rules[0].clone()
+    });
+    let events = extract(&client, document.as_bytes(), two_rules, 4096)
+        .await
+        .unwrap();
+    let errors = only!(events, Event::Error);
+    assert_eq!(errors.len(), 1, "two copies of 40 KiB do not fit in 64 KiB");
+    assert_eq!(
+        errors[0].code,
+        pb::ParseErrorCode::MemoryLimitExceeded as i32
+    );
+}

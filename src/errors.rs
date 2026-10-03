@@ -35,6 +35,11 @@ pub enum HandlerStop {
         /// Bytes of events waiting when the server gave up.
         queued_bytes: usize,
     },
+    /// Text held for reassembly outgrew the call's memory limit.
+    TextOverLimit {
+        /// The limit it outgrew, in bytes.
+        limit_bytes: usize,
+    },
 }
 
 impl fmt::Display for HandlerStop {
@@ -44,6 +49,11 @@ impl fmt::Display for HandlerStop {
             Self::NotReading { queued_bytes } => write!(
                 f,
                 "the client stopped reading responses with {queued_bytes} bytes of events waiting"
+            ),
+            Self::TextOverLimit { limit_bytes } => write!(
+                f,
+                "a text node outgrew the {limit_bytes} byte memory limit while being reassembled; \
+                 set raw_text_chunks to receive enormous text nodes as fragments instead"
             ),
         }
     }
@@ -125,11 +135,15 @@ pub fn selector_diagnostic(
 /// errors, and the only number we could synthesize is how much had been
 /// uploaded when the failure surfaced, which moves with the caller's chunk
 /// size and so is not a locator at all.
+///
+/// Text outgrowing the memory limit during reassembly is reported as the
+/// memory-limit failure it is, even though it surfaces from a handler: the
+/// limit covers that text as well as lol-html's own buffers.
 pub fn stream_error(err: &RewritingError) -> pb::StreamError {
     use pb::ParseErrorCode as Code;
 
     let code = match err {
-        RewritingError::MemoryLimitExceeded(_) => Code::MemoryLimitExceeded,
+        _ if is_memory_limit(err) => Code::MemoryLimitExceeded,
         RewritingError::ParsingAmbiguity(_) => Code::ParsingAmbiguity,
         RewritingError::ContentHandlerError(_) => Code::ContentHandlerError,
         // `RewritingError` is `#[non_exhaustive]`; this arm is mandatory.
@@ -145,9 +159,11 @@ pub fn stream_error(err: &RewritingError) -> pb::StreamError {
 /// Whether a parse failure is the kind a graceful bail-out converts into a
 /// truncated-but-successful run rather than a terminal error.
 ///
-/// Only the memory limit is configurable that way. An ambiguity bail-out is
-/// always terminal, because continuing past it is precisely the thing strict
-/// mode exists to refuse.
-pub const fn is_memory_limit(err: &RewritingError) -> bool {
+/// Only the memory limit is configurable that way, whether lol-html's own
+/// buffers or the server's text reassembly outgrew it. An ambiguity bail-out
+/// is always terminal, because continuing past it is precisely the thing
+/// strict mode exists to refuse.
+pub fn is_memory_limit(err: &RewritingError) -> bool {
     matches!(err, RewritingError::MemoryLimitExceeded(_))
+        || matches!(handler_stop(err), Some(HandlerStop::TextOverLimit { .. }))
 }

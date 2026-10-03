@@ -37,7 +37,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -394,6 +394,10 @@ async fn drive(
     let sink = Sink {
         outbound: outbound.clone(),
         send_timeout: limits.send_timeout,
+        text: Arc::new(TextBudget {
+            held: AtomicUsize::new(0),
+            limit: compiled.max_memory_bytes,
+        }),
     };
     let settings = build_settings(&compiled, &sink, &counters);
     let mut rewriter = HtmlRewriter::new(settings, |_: &[u8]| {});
@@ -595,6 +599,7 @@ fn stopped_by_client(
             outbound.abort(not_reading(limits.send_timeout));
             Some(Ending::NotReading)
         }
+        HandlerStop::TextOverLimit { .. } => None,
     }
 }
 
@@ -687,11 +692,12 @@ fn tally(compiled: &CompiledOptions, counters: &[Arc<AtomicU64>]) -> HashMap<Str
 }
 
 /// Where the handlers put events: the call's outbound queue, waiting up to
-/// the send timeout for room.
+/// the send timeout for room, plus the count of text held for reassembly.
 #[derive(Clone)]
 struct Sink {
     outbound: Outbound,
     send_timeout: Duration,
+    text: Arc<TextBudget>,
 }
 
 impl Sink {
@@ -710,6 +716,31 @@ impl Sink {
                 }
                 .into()
             })
+    }
+}
+
+/// Text held for reassembly across one call's handlers, counted against the
+/// call's memory limit.
+///
+/// lol-html's own limit cannot see this text. lol-html streams text out in
+/// pieces precisely so that it never holds a whole node; the server holds it
+/// instead, and without a count of its own one long text node, or one copy
+/// per text rule, would grow without bound.
+struct TextBudget {
+    held: AtomicUsize,
+    limit: usize,
+}
+
+impl TextBudget {
+    /// Count `bytes` more text as held, reporting whether that stays within
+    /// the limit. Over it the parse ends, so the count is not rolled back.
+    fn hold(&self, bytes: usize) -> bool {
+        self.held.fetch_add(bytes, Ordering::Relaxed) + bytes <= self.limit
+    }
+
+    /// Stop counting `bytes` of text that has left the handler.
+    fn release(&self, bytes: usize) {
+        self.held.fetch_sub(bytes, Ordering::Relaxed);
     }
 }
 
@@ -884,6 +915,11 @@ fn document_handlers(
 /// those to a caller unreassembled is the single most reliable way to make a
 /// client look correct in testing and cut words in half in production, which
 /// is why reassembly is the default and the raw view is opt-in.
+///
+/// The text held while a node is reassembled counts against the call's
+/// memory limit, summed across rules. A node that outgrows it ends the run
+/// the way any other memory-limit overrun does, rather than being split into
+/// pieces a caller relying on whole nodes would not expect.
 fn text_handler(
     rule_id: String,
     sink: Sink,
@@ -904,6 +940,7 @@ fn text_handler(
             // Reset even for text we are dropping: a filtered node must not
             // bleed into whatever is accumulated next.
             if last {
+                sink.text.release(buffer.len());
                 buffer.clear();
                 span = None;
             }
@@ -931,22 +968,38 @@ fn text_handler(
                 None => (bytes.start, bytes.end),
             });
         }
-        buffer.push_str(chunk.as_str());
+
+        let piece = chunk.as_str();
+        if !piece.is_empty() {
+            // Counted before it is copied, so the copy that would cross the
+            // limit is never made.
+            if !sink.text.hold(piece.len()) {
+                return Err(HandlerStop::TextOverLimit {
+                    limit_bytes: sink.text.limit,
+                }
+                .into());
+            }
+            buffer.push_str(piece);
+        }
 
         if last {
+            sink.text.release(buffer.len());
             // A text node with no text is not an event, and lol-html emits an
             // empty terminating chunk for every node, so this is the common
             // case rather than an edge one.
             if !buffer.is_empty() {
+                // Taken rather than copied or cleared, so a long node leaves
+                // no allocation of its size behind in this handler.
+                let written = std::mem::take(&mut buffer);
                 // lol-html hands text back exactly as written, so the entity
                 // decode the proto promises for DATA and RCDATA happens
                 // here, after reassembly — an entity split across fragments
                 // is whole again by this point. Raw mode never reaches this
                 // branch: fragments go out verbatim, as documented.
-                let text = if chunk.text_type().allows_html_entities() && buffer.contains('&') {
-                    htmlize::unescape(buffer.as_str()).into_owned()
+                let text = if chunk.text_type().allows_html_entities() && written.contains('&') {
+                    htmlize::unescape(written.as_str()).into_owned()
                 } else {
-                    std::mem::take(&mut buffer)
+                    written
                 };
                 sink.emit(pb::extract_response::Event::Text(pb::TextNode {
                     rule_id: rule_id.clone(),
@@ -956,7 +1009,6 @@ fn text_handler(
                     last_in_node: true,
                 }))?;
             }
-            buffer.clear();
             span = None;
         }
 
