@@ -2,7 +2,9 @@
 
 //! Binary entry point for the lol-html gRPC server.
 //!
-//! Runtime sizing (all optional environment overrides):
+//! Runtime sizing (all optional environment overrides; every one but the
+//! address is a positive whole number, and anything else stops the server at
+//! startup rather than falling back to the default):
 //! - `GRPC_LOL_HTML_ADDR` — listen address (default `0.0.0.0:50057`).
 //! - `GRPC_LOL_HTML_WORKERS` — tokio worker threads (default: CPU count).
 //! - `GRPC_LOL_HTML_MAX_CHUNK_BYTES` — largest inbound chunk accepted
@@ -72,12 +74,41 @@ const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!("gen/file_descriptor_set.binpb
 /// the one-window-per-round-trip floor rather than to absorb a bulk transfer.
 const DEFAULT_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
 
-/// Read a `usize` environment variable, falling back to `default`.
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
+/// The largest window HTTP/2 allows.
+const MAX_WINDOW_BYTES: u32 = (1 << 31) - 1;
+
+/// Read a positive `usize` environment variable, falling back to `default`
+/// when it is not set.
+///
+/// Every setting read this way is a size, a count or a timeout, and zero is
+/// a mistake for each of them: a server that takes no streams or times out
+/// at once. A typo quietly replaced by the default is worse than a server
+/// that refuses to start and says why, so both are errors.
+fn env_usize(name: &str, default: usize) -> Result<usize, String> {
+    match std::env::var(name) {
+        Ok(value) => positive(name, &value),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(value)) => {
+            Err(format!("{name}={value:?} is not a positive whole number"))
+        }
+    }
+}
+
+/// Parse the value of setting `name` as a positive whole number.
+fn positive(name: &str, value: &str) -> Result<usize, String> {
+    match value.parse() {
+        Ok(0) | Err(_) => Err(format!("{name}={value:?} is not a positive whole number")),
+        Ok(parsed) => Ok(parsed),
+    }
+}
+
+/// The HTTP/2 window size from setting `name`, which may be no larger than
+/// the 2^31 - 1 bytes HTTP/2 allows.
+fn window_size(name: &str, bytes: usize) -> Result<u32, String> {
+    u32::try_from(bytes)
         .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+        .filter(|&window| window <= MAX_WINDOW_BYTES)
+        .ok_or_else(|| format!("{name}={bytes} is larger than HTTP/2 allows ({MAX_WINDOW_BYTES})"))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -93,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workers = env_usize(
         "GRPC_LOL_HTML_WORKERS",
         std::thread::available_parallelism().map_or(4, usize::from),
-    );
+    )?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -112,34 +143,33 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_chunk_bytes(env_usize(
             "GRPC_LOL_HTML_MAX_CHUNK_BYTES",
             grpc_lol_html::service::DEFAULT_MAX_CHUNK_BYTES,
-        ))
+        )?)
         .with_idle_timeout(Duration::from_millis(env_usize(
             "GRPC_LOL_HTML_IDLE_TIMEOUT_MS",
             grpc_lol_html::service::DEFAULT_IDLE_TIMEOUT_MS,
-        ) as u64))
+        )? as u64))
         .with_send_timeout(Duration::from_millis(env_usize(
             "GRPC_LOL_HTML_SEND_TIMEOUT_MS",
             grpc_lol_html::service::DEFAULT_SEND_TIMEOUT_MS,
-        ) as u64))
+        )? as u64))
         .with_outbound_buffer_bytes(env_usize(
             "GRPC_LOL_HTML_OUTBOUND_BUFFER_BYTES",
             grpc_lol_html::service::DEFAULT_OUTBOUND_BUFFER_BYTES,
-        ))
+        )?)
         .with_max_memory_bytes(env_usize(
             "GRPC_LOL_HTML_MAX_MEMORY_BYTES",
             grpc_lol_html::service::DEFAULT_MEMORY_CEILING_BYTES,
-        ))
+        )?)
         .with_max_concurrent_streams(env_usize(
             "GRPC_LOL_HTML_MAX_CONCURRENT_STREAMS",
             grpc_lol_html::service::DEFAULT_MAX_CONCURRENT_STREAMS,
-        ));
+        )?);
     let service = grpc.into_service();
 
-    let window = u32::try_from(env_usize(
+    let window = window_size(
         "GRPC_LOL_HTML_WINDOW_BYTES",
-        DEFAULT_WINDOW_BYTES as usize,
-    ))
-    .unwrap_or(DEFAULT_WINDOW_BYTES);
+        env_usize("GRPC_LOL_HTML_WINDOW_BYTES", DEFAULT_WINDOW_BYTES as usize)?,
+    )?;
 
     // Reflection (v1) so clients like grpcurl can discover the contract from a
     // live server instead of shipping the .proto files around.
@@ -181,5 +211,31 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A setting is a positive whole number, and nothing else is quietly
+    /// read as the default.
+    #[test]
+    fn a_setting_must_be_a_positive_whole_number() {
+        assert_eq!(positive("N", "1"), Ok(1));
+        assert_eq!(positive("N", "60000"), Ok(60_000));
+        for bad in ["0", "", "-1", "1.5", " 5", "5ms", "sixty"] {
+            let err = positive("N", bad).expect_err(bad);
+            assert!(err.starts_with("N="), "the error names the setting: {err}");
+        }
+    }
+
+    /// A window must fit HTTP/2's 31 bits rather than wrap or be replaced.
+    #[test]
+    fn a_window_larger_than_http2_allows_is_refused() {
+        assert_eq!(window_size("W", 1 << 20), Ok(1 << 20));
+        assert_eq!(window_size("W", (1 << 31) - 1), Ok((1 << 31) - 1));
+        assert!(window_size("W", 1 << 31).is_err());
+        assert!(window_size("W", usize::MAX).is_err());
     }
 }

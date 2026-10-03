@@ -92,7 +92,9 @@ cd demos/node-client && npm install && npm start   # http://127.0.0.1:8080
 
 ## Configuration
 
-All optional, read at startup:
+All optional, read at startup. Every one but the address is a positive whole
+number; zero or anything that does not parse stops the server with an error
+naming the variable, rather than falling back to the default:
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -399,7 +401,7 @@ needs neither buf nor protoc.
 
 ```bash
 cargo build --release
-cargo test                                              # 81 tests
+cargo test                                              # 84 tests
 cargo clippy --all-targets --all-features -- -Dwarnings
 buf lint && buf build
 buf generate                                            # regenerate src/gen
