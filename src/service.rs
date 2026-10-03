@@ -14,12 +14,12 @@
 //!
 //! So the parse never runs on an async worker. Every `write()` and the final
 //! `end()` run on tokio's blocking pool, and the handlers put events straight
-//! onto the call's [`outbound`](crate::outbound) queue, which is bounded in
-//! bytes. A handler that finds it full waits, on its blocking thread, until
-//! the response stream takes something. That holds the parse still, which
-//! stops the driver reading the next inbound chunk, so a slow client slows
-//! the parser rather than growing a queue behind it, whatever the chunk size
-//! and however many rules match.
+//! onto the call's [`outbound`] queue, which is bounded in bytes. A handler
+//! that finds it full waits, on its blocking thread, until the response
+//! stream takes something. That holds the parse still, which stops the
+//! driver reading the next inbound chunk, so a slow client slows the parser
+//! rather than growing a queue behind it, whatever the chunk size and however
+//! many rules match.
 //!
 //! The blocking pool is also what makes a large chunk harmless to everyone
 //! else: it is one long parse on a thread nobody is waiting for, rather than

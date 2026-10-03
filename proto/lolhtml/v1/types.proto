@@ -143,9 +143,14 @@ message Attribute {
 // to make that buffer grow without bound, so a server that accepts untrusted
 // HTML needs this set.
 message MemoryLimits {
-  // Hard cap in bytes on the parser's buffered state. Zero means the server's
-  // own default rather than "unlimited"; a server accepting arbitrary input
-  // should never run unlimited.
+  // Hard cap in bytes on the parser's buffered state, and separately on the
+  // text the server holds while reassembling text nodes, summed across rules
+  // (see `raw_text_chunks`). Zero means the server's own default rather than
+  // "unlimited"; a server accepting arbitrary input should never run
+  // unlimited.
+  //
+  // The server also has a ceiling of its own, and a larger value is cut to
+  // it, as is the default when the ceiling is lower.
   uint64 max_bytes = 1;
 
   // What to do when `max_bytes` is reached.
@@ -162,6 +167,9 @@ message MemoryLimits {
   // Mirrors `MemorySettings::preallocated_parsing_buffer_size`. Zero means
   // lol-html's default of 1 KiB. Raising it trades memory for fewer regrowths
   // on documents known to buffer heavily; it is a tuning knob, not a limit.
+  //
+  // lol-html charges the preallocation against `max_bytes`, so it is never
+  // more than that: a larger value, the 1 KiB default included, is cut to it.
   uint64 preallocated_buffer_bytes = 3;
 }
 
@@ -207,6 +215,9 @@ message ExtractRule {
   // produces. Need not be unique, though overlapping ids make the output
   // ambiguous. Rules are independent: an element matching three rules
   // produces three events.
+  //
+  // At most 256 bytes; a longer id is INVALID_ARGUMENT. It is repeated on
+  // every match, so a long one is paid for per event.
   string id = 1;
 
   // A CSS selector, compiled by lol-html's selector VM.
@@ -231,6 +242,8 @@ message ExtractRule {
   // `:first-child` against `:last-child` is the whole idea: an element is
   // known to be first the moment it is seen, and cannot be known to be last
   // until its parent closes. None of these rejections are pending work.
+  //
+  // At most 4096 bytes; a longer selector is INVALID_ARGUMENT.
   //
   // Use `ValidateSelectors` to check before spending an upload.
   string selector = 2;
@@ -338,8 +351,9 @@ enum ParseErrorCode {
   PARSE_ERROR_CODE_UNSPECIFIED = 0;
 
   // The parser needed more buffered state than `MemoryLimits.max_bytes`
-  // allowed. Seen as an error only when `graceful_bail_out` was false;
-  // otherwise the run ends with a `finished` event carrying `bailed_out`.
+  // allowed, or a text node outgrew it while the server reassembled it. Seen
+  // as an error only when `graceful_bail_out` was false; otherwise the run
+  // ends with a `finished` event carrying `bailed_out`.
   PARSE_ERROR_CODE_MEMORY_LIMIT_EXCEEDED = 1;
 
   // The document reached a state where a streaming parser cannot determine
@@ -347,9 +361,11 @@ enum ParseErrorCode {
   // `ExtractOptions.strict`.
   PARSE_ERROR_CODE_PARSING_AMBIGUITY = 2;
 
-  // A content handler failed. The server's handlers only fail when the
-  // response stream has already gone away, so a client should not normally
-  // observe this.
+  // A content handler failed for a reason the server does not report more
+  // specifically. Its handlers otherwise stop only when the response stream
+  // has gone away or the client has stopped reading, both of which end the
+  // call with a status instead, so a client should not normally observe
+  // this.
   PARSE_ERROR_CODE_CONTENT_HANDLER_ERROR = 3;
 }
 

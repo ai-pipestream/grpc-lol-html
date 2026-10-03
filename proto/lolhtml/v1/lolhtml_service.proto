@@ -11,8 +11,11 @@
 // to go back and read a second time. Holding the document server-side to
 // offer a handle would discard the one property the library exists for. So
 // `Extract` is bidirectional: chunks flow in while events flow out, the first
-// events arrive before the last byte has been uploaded, and server memory
-// stays flat regardless of document size.
+// events arrive before the last byte has been uploaded, and server memory does
+// not grow with document size. What one call may hold is bounded instead: its
+// parser state and reassembled text by `MemoryLimits`, under a server ceiling;
+// its unsent events by a per-call buffer; its rules by the caps on
+// `ExtractOptions`.
 //
 // There is no unary convenience RPC. lol-html's in-memory `rewrite_str` path
 // cannot honour an encoding or a memory limit, so a unary RPC built on it
@@ -41,8 +44,19 @@ service LolHtmlService {
   // carries a `chunk` of document bytes, in order. Half-close the request
   // stream to signal the end of the document.
   //
-  // The response stream always begins with `started` and always ends with
-  // either `finished` or `error`, whatever happens in between.
+  // The response stream always begins with `started` and ends with either
+  // `finished` or `error`, unless the call itself fails with a status:
+  // INVALID_ARGUMENT for a misplaced or oversized frame, DEADLINE_EXCEEDED
+  // when the upload goes idle for the server's idle timeout, and
+  // RESOURCE_EXHAUSTED when the client takes no responses for the server's
+  // send timeout. The call never ends OK without `finished` or `error`.
+  //
+  // Read the response stream while uploading, not after. The server holds a
+  // bounded amount of unsent events for a client; once that is full it stops
+  // reading the upload until the client reads. A client that finishes its
+  // upload before it reads anything therefore stalls on output larger than
+  // that, and the server ends the call with RESOURCE_EXHAUSTED rather than
+  // wait for it forever.
   //
   // Send the `options` frame before waiting on the response. The server
   // validates options before it opens the response stream, so it produces no
@@ -90,6 +104,10 @@ message ExtractRequest {
 message ExtractOptions {
   // Selector-scoped rules. May be empty if `document_rule` is set, which is
   // how you ask only for the doctype.
+  //
+  // At most 256 rules; a larger set is INVALID_ARGUMENT. Every rule is
+  // matched against every element and every match is its own event, so the
+  // rule count multiplies both the work and the output.
   repeated ExtractRule rules = 1;
 
   // Content outside every element, which no selector can reach. Optional.
@@ -148,6 +166,12 @@ message ExtractOptions {
   // `last_in_node` marking the end of each node. That keeps server memory
   // constant even for a single enormous text node, at the cost of doing the
   // reassembly yourself.
+  //
+  // Reassembly is where a node is held whole, so the text held for it counts
+  // against `MemoryLimits.max_bytes`, summed across rules. A node that
+  // outgrows the limit ends the run with MEMORY_LIMIT_EXCEEDED, or with
+  // `bailed_out` under `graceful_bail_out`; set this instead if you expect
+  // text nodes that large.
   //
   // Raw fragments are verbatim: no entity decoding, because an entity can be
   // split across two fragments and a fragment-at-a-time decode would corrupt

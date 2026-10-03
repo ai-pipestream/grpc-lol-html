@@ -51,21 +51,32 @@ to. Wrapping it in a handle store would mean holding the whole document
 server-side and re-parsing per read, which throws away the one property the
 library exists for.
 
-So server memory stays flat regardless of document size, and **the first
-matches arrive before the last byte has been uploaded**. Both are tests rather
-than claims. `matches_arrive_before_the_upload_is_finished` in
-`tests/extract.rs` holds the second half of a document back and still demands
-its match, and `tests/memory.rs` watches the real server binary's peak RSS
-while feeding it successively larger documents:
+So server memory does not grow with document size, and **the first matches
+arrive before the last byte has been uploaded**. Both are tests rather than
+claims. `matches_arrive_before_the_upload_is_finished` in `tests/extract.rs`
+holds the second half of a document back and still demands its match, and
+`tests/memory.rs` watches the real server binary's peak RSS while feeding it
+successively larger documents:
 
 ```
   document      1 MiB    16 MiB    64 MiB   128 MiB   256 MiB
-  peak RSS     13 MiB    22 MiB    24 MiB    26 MiB    27 MiB
+  peak RSS     30 MiB    42 MiB    42 MiB    42 MiB    43 MiB
 ```
 
-256 times the document for twice the memory, and nearly all of that is the
-first step, where a freshly started process touches its buffers for the first
-time. Retaining documents would have put the last column at 260 MiB.
+256 times the document for less than one and a half times the memory, and
+nearly all of that is the first step, where a freshly started process touches
+its buffers for the first time. Retaining documents would have put the last
+column near 300 MiB. (A release build, measured with the outbound buffer
+described below in place; the same harness on the previous design, on the
+same machine, peaked at 46 MiB.)
+
+Not growing with the document is not the same as costing nothing. What one
+call can hold is bounded by limits rather than by its input, and the bounds
+are the ones under [Safety](#safety): parser state and reassembled text by the
+call's memory limit, unsent events by the outbound buffer, one in-flight chunk
+by the chunk cap, and the work per element by the cap on rules. A document of
+any length, including one built to be hostile, stays inside them; the same
+test feeds the server a single 64 MiB text node and watches the peak not move.
 
 You can also watch it happen. `demos/node-client` has a web viewer that POSTs a
 document and reads the events off the same response, drawing matches as they
@@ -90,6 +101,9 @@ All optional, read at startup:
 | `GRPC_LOL_HTML_MAX_CHUNK_BYTES` | 100 MiB | largest inbound chunk accepted |
 | `GRPC_LOL_HTML_WINDOW_BYTES` | 4 MiB | HTTP/2 initial stream and connection window |
 | `GRPC_LOL_HTML_IDLE_TIMEOUT_MS` | 60000 | end an `Extract` stream whose client stops sending |
+| `GRPC_LOL_HTML_SEND_TIMEOUT_MS` | 60000 | end an `Extract` stream whose client stops reading |
+| `GRPC_LOL_HTML_OUTBOUND_BUFFER_BYTES` | 8 MiB | unsent events one stream may hold before the parse waits for its client |
+| `GRPC_LOL_HTML_MAX_MEMORY_BYTES` | 64 MiB | ceiling on the memory limit a call may ask for |
 | `GRPC_LOL_HTML_MAX_CONCURRENT_STREAMS` | 64 | cap on open `Extract` streams; past it, calls fail with `RESOURCE_EXHAUSTED` |
 
 The idle timeout is idle, not total: it resets with every frame, so a document
@@ -100,6 +114,16 @@ stream cap is per-process and per-parser, orthogonal to tonic's per-connection
 `max_concurrent_streams` (1024): each open stream is a parser instance with
 its own buffers, so an unbounded count would be an unbounded memory
 commitment.
+
+The send timeout is the same idea in the other direction, and idle in the same
+way: every response the client takes starts it over, so a slow reader never
+reaches it. Events wait in a per-stream buffer bounded in bytes; when it is
+full the parse waits for the client, and so does the reading of the upload.
+A client that takes nothing for the send timeout gets `RESOURCE_EXHAUSTED`,
+its unsent events are discarded, and its stream slot goes back to the pool,
+so 64 clients that never read cannot lock the service out. Set the buffer
+below 64 KiB and events go out in DATA frames small enough for some HTTP/2
+clients to treat as a flood.
 
 Logs go through [tracing](https://docs.rs/tracing): `RUST_LOG` picks the
 filter (default `info`), and at that level each finished stream logs one line
@@ -121,7 +145,7 @@ This is the load-bearing test, and it earned its keep: it is what caught both
 of the upstream problems described under "Two things lol-html gets wrong",
 below. Neither was visible from reading the library's documentation.
 
-## The five things clients get wrong
+## The six things clients get wrong
 
 ### 1. Text chunks are not text nodes
 
@@ -133,7 +157,11 @@ in half in production, at document sizes you did not test.
 The server reassembles by default and emits one `text` event per text node.
 Set `raw_text_chunks` if you want the fragments, which keeps server memory
 constant even for a single enormous text node; concatenating a node's fragments
-in order reproduces the reassembled text exactly.
+in order reproduces the reassembled text exactly. Reassembly holds the node
+until it ends, so that text counts against the call's memory limit, and a node
+larger than the limit ends the run with `MEMORY_LIMIT_EXCEEDED` (or a
+`bailed_out` finish, under `graceful_bail_out`) rather than arriving in
+pieces nobody asked for.
 
 ### 2. It does not run JavaScript
 
@@ -180,6 +208,20 @@ response headers until it has them. A client that feeds the request from a
 queue and awaits the call *first* will wait forever. Clients that build the
 request as an iterator never notice.
 
+### 6. Read while you upload, not after
+
+The server holds a bounded amount of output for each stream. When the client
+is not taking it, the parse waits, and so does the reading of the upload,
+which is how backpressure works and why a slow client costs the server
+nothing. A client that writes the whole document before its first read turns
+that into a standoff once the output outgrows the buffer: its upload blocks on
+a full HTTP/2 window and it never gets to the read that would unblock it.
+After the send timeout the server gives up, keeps reading the upload so the
+client can finish it, and answers the first read with `RESOURCE_EXHAUSTED`.
+Small outputs fit in the buffer and work anyway, which is what makes this easy
+to ship. Read on a second thread, or with an async or callback API, the same
+as any bidirectional stream.
+
 ## Selectors: what compiles and what does not
 
 Wider than "no tree, no selectors" suggests, and the line is worth knowing.
@@ -219,9 +261,24 @@ open web must not run that way, so an unset or zero `limits.max_bytes` means
 success carrying `bailed_out` if you set `graceful_bail_out`. Either way the
 process survives, which
 `a_document_over_its_memory_cap_fails_in_band_and_the_server_survives` checks
-by streaming a second document through afterwards. The cap bounds parser state;
-what keeps total memory flat is that nothing is retained, which is the table
-above.
+by streaming a second document through afterwards.
+
+**And the caller does not get the last word on it.** A request can lower its
+limit but not raise it past the server's ceiling, `GRPC_LOL_HTML_MAX_MEMORY_BYTES`
+(64 MiB by default); asking for more gets the ceiling, so no caller can switch
+the parser's memory guard off by asking for `u64::MAX`. The same limit covers
+the text the server holds while reassembling text nodes, summed across rules,
+which lol-html's own accounting never sees. A preallocation larger than the
+limit is cut to it.
+
+**Every buffer a call can fill has a bound.** Parser state and reassembled
+text: the memory limit. Unsent events: the outbound buffer, 8 MiB per stream,
+with the parse waiting on the client beyond that, and the call ended after the
+send timeout if the client takes nothing. One inbound chunk: the chunk cap. The
+work and the output per element: at most 256 rules, with ids of at most 256
+bytes and selectors of at most 4096. So a stream's memory has a ceiling set by
+configuration, and the process's by that times the stream cap; nothing in
+between depends on what the document says or how long it is.
 
 **UTF-16 is refused up front.** lol-html's tokenizer scans for ASCII markup
 bytes, so UTF-16LE/BE, ISO-2022-JP and `replacement` are rejected with
@@ -230,11 +287,18 @@ bytes, so UTF-16LE/BE, ISO-2022-JP and `replacement` are rejected with
 **Chunk size is capped** at 100 MiB, tunable with
 `GRPC_LOL_HTML_MAX_CHUNK_BYTES`. This is not a document size limit; a document
 is any number of chunks and has no ceiling. It bounds how much one message
-carries, and so how long a single uninterruptible parse can hold an async
-worker. tonic's own decoding limit is derived from it at twice the value,
-deliberately above rather than equal, so an ordinary overshoot gets the
-`INVALID_ARGUMENT` that names the limit rather than the transport's
-`OutOfRange`.
+carries, and so how long a single uninterruptible parse runs and how large a
+buffer each in-flight call holds. tonic's own decoding limit is derived from it
+at twice the value, deliberately above rather than equal, so an ordinary
+overshoot gets the `INVALID_ARGUMENT` that names the limit rather than the
+transport's `OutOfRange`.
+
+**Parsing never runs on an async worker.** Every chunk is parsed on tokio's
+blocking pool, so even a 100 MiB one is one long parse on a thread nobody else
+is waiting for, rather than seconds in which health checks, keepalives and
+other streams cannot be served.
+`a_large_chunk_is_parsed_without_holding_up_other_calls` holds a call open
+mid-parse on a single-threaded runtime and requires it to be answered.
 
 Sending a chunk that large is allowed but pointless. The benchmark plateaus
 around 256 KiB: 16 KiB against 1 MiB is roughly 85 against 96 MiB/s, and above
@@ -326,7 +390,7 @@ needs neither buf nor protoc.
 
 ```bash
 cargo build --release
-cargo test                                              # 48 tests
+cargo test                                              # 78 tests
 cargo clippy --all-targets --all-features -- -Dwarnings
 buf lint && buf build
 buf generate                                            # regenerate src/gen

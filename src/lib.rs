@@ -6,9 +6,12 @@
 //! Design rules:
 //! - **Nothing is retained.** `lol_html` is a forward-only transducer: bytes
 //!   in, events out, no document to go back to. There is no handle store and
-//!   no server-side copy of the input, so memory stays flat whatever the
-//!   document size. This is the opposite of the sibling `grpc-calamine`
-//!   service, and it is the library's nature rather than a simplification.
+//!   no server-side copy of the input, so memory does not grow with the
+//!   document. What a call can hold instead is bounded by limits: its memory
+//!   limit, under a server ceiling, for parser state and reassembled text; the
+//!   [`outbound`] buffer for unsent events; the chunk cap for input. This is
+//!   the opposite of the sibling `grpc-calamine` service, and it is the
+//!   library's nature rather than a simplification.
 //! - **Backpressure survives the sync/async boundary.** `lol_html` handlers
 //!   are synchronous closures that cannot await, so the parse runs on tokio's
 //!   blocking pool and the handlers put events straight onto a queue bounded
