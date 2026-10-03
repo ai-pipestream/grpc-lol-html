@@ -95,6 +95,14 @@ pub const DEFAULT_IDLE_TIMEOUT_MS: usize = 60_000;
 /// orthogonal to tonic's per-connection `max_concurrent_streams`.
 pub const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 64;
 
+/// Default ceiling on the memory limit a call may ask for, in bytes.
+///
+/// A call names its own limit in `MemoryLimits.max_bytes`, and without a
+/// ceiling it could name `u64::MAX` and switch the parser's only memory guard
+/// off. The default equals the per-call default, so callers can lower their
+/// limit but not raise it unless the operator raises this.
+pub const DEFAULT_MEMORY_CEILING_BYTES: usize = rules::DEFAULT_MAX_MEMORY_BYTES as usize;
+
 /// Queue the handlers push into, drained after every chunk.
 type EventSink = mpsc::UnboundedSender<pb::extract_response::Event>;
 
@@ -102,6 +110,7 @@ type EventSink = mpsc::UnboundedSender<pb::extract_response::Event>;
 pub struct LolHtmlGrpc {
     max_chunk_bytes: usize,
     idle_timeout: Duration,
+    memory_ceiling: usize,
     stream_permits: Arc<Semaphore>,
 }
 
@@ -118,6 +127,7 @@ impl LolHtmlGrpc {
         Self {
             max_chunk_bytes: DEFAULT_MAX_CHUNK_BYTES,
             idle_timeout: Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS as u64),
+            memory_ceiling: DEFAULT_MEMORY_CEILING_BYTES,
             stream_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_STREAMS)),
         }
     }
@@ -134,6 +144,13 @@ impl LolHtmlGrpc {
     #[must_use]
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
+        self
+    }
+
+    /// Override the ceiling on the memory limit a call may ask for.
+    #[must_use]
+    pub fn with_max_memory_bytes(mut self, bytes: usize) -> Self {
+        self.memory_ceiling = bytes;
         self
     }
 
@@ -210,7 +227,7 @@ impl pb::lol_html_service_server::LolHtmlService for LolHtmlGrpc {
             }
         };
 
-        let compiled = rules::compile(&options)?;
+        let compiled = rules::compile(&options, self.memory_ceiling)?;
         let (tx, rx) = mpsc::channel(OUTBOUND_BUFFER);
         let max_chunk_bytes = self.max_chunk_bytes;
         let idle_timeout = self.idle_timeout;
@@ -233,7 +250,11 @@ impl pb::lol_html_service_server::LolHtmlService for LolHtmlGrpc {
         &self,
         request: Request<pb::ValidateSelectorsRequest>,
     ) -> Result<Response<pb::ValidateSelectorsResponse>, Status> {
-        let diagnostics = rules::diagnose(&request.into_inner().rules);
+        let rules = request.into_inner().rules;
+        // The same shape limits as Extract, so a set this call passes is
+        // never refused there for its size.
+        rules::check_rule_set(&rules)?;
+        let diagnostics = rules::diagnose(&rules);
         Ok(Response::new(pb::ValidateSelectorsResponse { diagnostics }))
     }
 

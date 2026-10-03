@@ -1564,3 +1564,145 @@ async fn streams_past_the_concurrency_cap_fail_fast() {
         "the permit should be released when the first stream ends"
     );
 }
+
+// ---------------------------------------------------------------------------
+// What one call may cost
+// ---------------------------------------------------------------------------
+
+/// The shape of a rule set is capped, and `ValidateSelectors` applies the same
+/// caps as `Extract`, so a set it passes is never refused for its size.
+#[tokio::test]
+async fn a_rule_set_over_the_shape_limits_is_refused_by_both_rpcs() {
+    use grpc_lol_html::rules::{MAX_RULES, MAX_SELECTOR_BYTES};
+
+    let client = start_server().await;
+    let too_many: Vec<_> = (0..=MAX_RULES)
+        .map(|n| rule(&format!("r{n}"), "p"))
+        .collect();
+    let too_long = vec![rule(
+        "long",
+        &format!("div{}", ".c".repeat(MAX_SELECTOR_BYTES)),
+    )];
+
+    for rules in [too_many, too_long] {
+        let err = extract(
+            &client,
+            b"<p>x</p>",
+            pb::ExtractOptions {
+                rules: rules.clone(),
+                ..Default::default()
+            },
+            64,
+        )
+        .await
+        .expect_err("Extract should refuse the rule set");
+        assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+
+        let err = client
+            .clone()
+            .validate_selectors(pb::ValidateSelectorsRequest { rules })
+            .await
+            .expect_err("ValidateSelectors should refuse it too");
+        assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    }
+
+    let at_the_cap: Vec<_> = (0..MAX_RULES)
+        .map(|n| rule(&format!("r{n}"), "p"))
+        .collect();
+    let events = extract(
+        &client,
+        b"<p>x</p>",
+        pb::ExtractOptions {
+            rules: at_the_cap,
+            ..Default::default()
+        },
+        64,
+    )
+    .await
+    .expect("a rule set at the cap is fine");
+    assert_eq!(
+        only!(events, Event::Started)[0].rule_count as usize,
+        MAX_RULES
+    );
+}
+
+/// The caller picks its memory limit, but the server caps it: asking for
+/// `u64::MAX` must not switch the parser's only memory guard off.
+#[tokio::test]
+async fn a_memory_limit_above_the_server_ceiling_is_cut_to_it() {
+    let greedy = pb::ExtractOptions {
+        limits: Some(pb::MemoryLimits {
+            max_bytes: u64::MAX,
+            ..Default::default()
+        }),
+        ..everything()
+    };
+
+    let capped = start_configured_server(
+        LolHtmlGrpc::new()
+            .with_max_memory_bytes(4096)
+            .into_service(),
+    )
+    .await;
+    let events = extract_file(&capped, "deep_nesting.html", greedy.clone(), 1024).await;
+    let errors = only!(events, Event::Error);
+    assert_eq!(
+        errors.len(),
+        1,
+        "the 4 KiB ceiling should have stopped the parse"
+    );
+    assert_eq!(
+        errors[0].code,
+        pb::ParseErrorCode::MemoryLimitExceeded as i32,
+        "{}",
+        errors[0].message
+    );
+
+    // The same request against the default ceiling gets through, so it was
+    // the ceiling, not the request, that stopped it above.
+    let roomy = start_server().await;
+    let events = extract_file(&roomy, "deep_nesting.html", greedy, 1024).await;
+    assert!(matches!(
+        events.last().and_then(|e| e.event.as_ref()),
+        Some(Event::Finished(_))
+    ));
+}
+
+/// A preallocation over the memory limit, including lol-html's own 1 KiB
+/// default under a limit below that, is clamped rather than handed to
+/// lol-html, which skips it silently in a release build and panics in a
+/// debug one, taking the call down without a result.
+#[tokio::test]
+async fn a_preallocation_over_the_memory_limit_does_not_break_the_call() {
+    let client = start_server().await;
+    for limits in [
+        pb::MemoryLimits {
+            max_bytes: 4096,
+            preallocated_buffer_bytes: 1 << 30,
+            graceful_bail_out: false,
+        },
+        pb::MemoryLimits {
+            max_bytes: 512,
+            ..Default::default()
+        },
+    ] {
+        let events = extract_file(
+            &client,
+            "doctype_legacy.html",
+            pb::ExtractOptions {
+                limits: Some(limits),
+                ..everything()
+            },
+            64,
+        )
+        .await;
+        assert!(
+            matches!(
+                events.last().and_then(|e| e.event.as_ref()),
+                Some(Event::Finished(_) | Event::Error(_))
+            ),
+            "the call must end with a result, not a dropped stream ({limits:?}): {:?}",
+            events.last()
+        );
+    }
+}
