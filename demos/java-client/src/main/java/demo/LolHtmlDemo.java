@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 package demo;
 
+import io.grpc.Channel;
 import io.grpc.Grpc;
 import io.grpc.InsecureChannelCredentials;
 import io.grpc.ManagedChannel;
+import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
 import com.google.protobuf.ByteString;
@@ -23,6 +25,7 @@ import lolhtml.v1.ValidateSelectorsResponse;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -45,6 +48,24 @@ import java.util.stream.Collectors;
 public final class LolHtmlDemo {
 
     private static final int CHUNK_BYTES = 64 * 1024;
+
+    /**
+     * How long one call may take, end to end.
+     *
+     * <p>Without a deadline a call waits for as long as the server does, and
+     * so does the latch that waits for it, so a server that stalls mid-stream
+     * hangs this process forever. A minute is far more than any document a
+     * demo is handed needs, and it still bounds the wait.
+     */
+    static final Duration DEADLINE = Duration.ofSeconds(60);
+
+    /**
+     * How much longer than the deadline to wait for the call to report that
+     * it has failed. The deadline fails the call on time; this is only for a
+     * transport that cannot deliver even that, which must not hang the demo
+     * either.
+     */
+    private static final Duration DEADLINE_GRACE = Duration.ofSeconds(5);
 
     public static void main(String[] args) throws Exception {
         List<String> argv = Arrays.asList(args);
@@ -121,32 +142,51 @@ public final class LolHtmlDemo {
         try {
             // Selector mistakes are the most common way to get an empty result,
             // and checking costs one cheap round trip against no upload at all.
-            ValidateSelectorsResponse report = LolHtmlServiceGrpc.newBlockingStub(channel)
-                    .validateSelectors(ValidateSelectorsRequest.newBuilder().addAllRules(rules).build());
-            if (report.getDiagnosticsCount() > 0) {
-                for (SelectorDiagnostic d : report.getDiagnosticsList()) {
-                    System.err.printf("bad selector in rule %s: %s%n  %s: %s%n",
-                            d.getRuleId(), d.getSelector(), d.getCode(), d.getMessage());
-                }
+            if (validate(channel, rules, DEADLINE) != 0) {
                 System.exit(1);
             }
 
             byte[] document = Files.readAllBytes(Path.of(positional.get(0)));
-            int exit = extract(channel, document, options.build());
+            int exit = extract(channel, document, options.build(), DEADLINE);
             System.exit(exit);
         } finally {
             channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
         }
     }
 
-    /** Run one document through Extract, printing each event as it arrives. */
-    private static int extract(ManagedChannel channel, byte[] document, ExtractOptions options)
+    /**
+     * Check the rules' selectors, reporting any that do not compile. Returns
+     * the exit code: zero when every selector compiled.
+     */
+    static int validate(Channel channel, List<ExtractRule> rules, Duration deadline) {
+        ValidateSelectorsResponse report;
+        try {
+            report = LolHtmlServiceGrpc.newBlockingStub(channel)
+                    .withDeadlineAfter(deadline.toMillis(), TimeUnit.MILLISECONDS)
+                    .validateSelectors(ValidateSelectorsRequest.newBuilder().addAllRules(rules).build());
+        } catch (StatusRuntimeException e) {
+            System.err.println("rpc failed: " + describe(e.getStatus()));
+            return 1;
+        }
+        for (SelectorDiagnostic d : report.getDiagnosticsList()) {
+            System.err.printf("bad selector in rule %s: %s%n  %s: %s%n",
+                    d.getRuleId(), d.getSelector(), d.getCode(), d.getMessage());
+        }
+        return report.getDiagnosticsCount() > 0 ? 1 : 0;
+    }
+
+    /**
+     * Run one document through Extract, printing each event as it arrives.
+     * Returns the exit code: zero when the call completed.
+     */
+    static int extract(Channel channel, byte[] document, ExtractOptions options, Duration deadline)
             throws InterruptedException {
         CountDownLatch done = new CountDownLatch(1);
         StringBuilder failure = new StringBuilder();
 
-        StreamObserver<ExtractRequest> requests =
-                LolHtmlServiceGrpc.newStub(channel).extract(new StreamObserver<>() {
+        StreamObserver<ExtractRequest> requests = LolHtmlServiceGrpc.newStub(channel)
+                .withDeadlineAfter(deadline.toMillis(), TimeUnit.MILLISECONDS)
+                .extract(new StreamObserver<>() {
                     @Override
                     public void onNext(ExtractResponse response) {
                         String line = format(response);
@@ -158,7 +198,7 @@ public final class LolHtmlDemo {
                     @Override
                     public void onError(Throwable t) {
                         failure.append(t instanceof StatusRuntimeException e
-                                ? e.getStatus().getDescription() : t.getMessage());
+                                ? describe(e.getStatus()) : t.getMessage());
                         done.countDown();
                     }
 
@@ -179,12 +219,27 @@ public final class LolHtmlDemo {
         }
         requests.onCompleted();
 
-        done.await();
+        // Read on gRPC's threads while the upload above went out, which is
+        // what the server needs: it holds only so much for a client that is
+        // not reading. The deadline ends the call, and this wait, on time.
+        if (!done.await(deadline.plus(DEADLINE_GRACE).toMillis(), TimeUnit.MILLISECONDS)) {
+            requests.onError(Status.CANCELLED
+                    .withDescription("no answer within the deadline").asRuntimeException());
+            System.err.println("rpc failed: no answer within " + deadline);
+            return 1;
+        }
         if (failure.length() > 0) {
             System.err.println("rpc failed: " + failure);
             return 1;
         }
         return 0;
+    }
+
+    /** A status as one line: its code, then what the server or library said. */
+    private static String describe(Status status) {
+        return status.getDescription() == null
+                ? status.getCode().toString()
+                : status.getCode() + ": " + status.getDescription();
     }
 
     private static ExtractRule rule(String id, String selector, List<Capture> captures) {

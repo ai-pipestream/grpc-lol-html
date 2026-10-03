@@ -60,6 +60,45 @@ async fn start_server() -> LolHtmlServiceClient<Channel> {
 async fn start_configured_server(
     service: pb::lol_html_service_server::LolHtmlServiceServer<LolHtmlGrpc>,
 ) -> LolHtmlServiceClient<Channel> {
+    let addr = serve(service).await;
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .expect("connect to server");
+    LolHtmlServiceClient::new(channel)
+}
+
+/// Like [`start_configured_server`], with a client whose HTTP/2 receive
+/// windows are `window` bytes, so that a client which does not read backs the
+/// server up after kilobytes rather than megabytes.
+async fn start_server_with_client_window(
+    service: pb::lol_html_service_server::LolHtmlServiceServer<LolHtmlGrpc>,
+    window: u32,
+) -> LolHtmlServiceClient<Channel> {
+    connect_with_window(serve(service).await, window).await
+}
+
+/// A client on its own connection, with HTTP/2 receive windows of `window`
+/// bytes.
+async fn connect_with_window(
+    addr: std::net::SocketAddr,
+    window: u32,
+) -> LolHtmlServiceClient<Channel> {
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .initial_stream_window_size(window)
+        .initial_connection_window_size(window)
+        .connect()
+        .await
+        .expect("connect to server");
+    LolHtmlServiceClient::new(channel)
+}
+
+/// Serve `service` on an ephemeral localhost port.
+async fn serve(
+    service: pb::lol_html_service_server::LolHtmlServiceServer<LolHtmlGrpc>,
+) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
@@ -71,12 +110,7 @@ async fn start_configured_server(
             .await
             .expect("server failed");
     });
-    let channel = Endpoint::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .expect("connect to server");
-    LolHtmlServiceClient::new(channel)
+    addr
 }
 
 /// A rule asking for everything, which is what most tests want.
@@ -1497,6 +1531,108 @@ async fn a_stalled_upload_is_ended_with_deadline_exceeded() {
     );
 }
 
+/// Open a call to `client` and keep sending `frame` every 50 ms after the
+/// options, returning how the call ended and how long that took, or `None`
+/// if it was still open after three seconds.
+async fn keep_sending(
+    client: &mut LolHtmlServiceClient<Channel>,
+    frame: pb::ExtractRequest,
+) -> Option<(tonic::Status, std::time::Duration)> {
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    tx.send(options_frame(pb::ExtractOptions {
+        rules: vec![rule("p", "p")],
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    tx.send(chunk_frame(b"<p>hi</p>")).await.unwrap();
+    let started = std::time::Instant::now();
+    let mut stream = client
+        .extract(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .expect("open the call")
+        .into_inner();
+
+    let sender = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if tx.send(frame.clone()).await.is_err() {
+                break;
+            }
+        }
+    });
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match stream.message().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the call ended OK, though the upload never finished"),
+                Err(status) => break status,
+            }
+        }
+    })
+    .await;
+    sender.abort();
+    ended.ok().map(|status| (status, started.elapsed()))
+}
+
+/// Frames that carry nothing do not keep a stream alive.
+///
+/// The idle timeout used to start over with every frame, so a client that
+/// sent an empty frame or an empty chunk now and then held its stream, and
+/// its parser, for as long as it liked without sending a byte of document.
+#[tokio::test]
+async fn frames_that_carry_nothing_do_not_hold_off_the_idle_timeout() {
+    let mut client = start_configured_server(
+        LolHtmlGrpc::new()
+            .with_idle_timeout(std::time::Duration::from_millis(300))
+            .into_service(),
+    )
+    .await;
+
+    for (what, frame) in [
+        ("empty frames", pb::ExtractRequest { frame: None }),
+        ("empty chunks", chunk_frame(b"")),
+    ] {
+        let (status, took) = keep_sending(&mut client, frame)
+            .await
+            .unwrap_or_else(|| panic!("{what} kept the stream open past the idle timeout"));
+        assert_eq!(status.code(), Code::DeadlineExceeded, "{what}: {status:?}");
+        assert!(
+            took >= std::time::Duration::from_millis(300),
+            "{what}: ended after {took:?}"
+        );
+    }
+}
+
+/// A client that keeps sending document bytes still has to finish its
+/// upload within the upload timeout.
+///
+/// The idle timeout bounds silence and nothing else, so a client trickling
+/// a few bytes at a time could hold a stream for ever without it.
+#[tokio::test]
+async fn an_upload_that_never_finishes_is_ended_by_the_upload_timeout() {
+    let mut client = start_configured_server(
+        LolHtmlGrpc::new()
+            .with_upload_timeout(std::time::Duration::from_millis(500))
+            .into_service(),
+    )
+    .await;
+
+    let (status, took) = keep_sending(&mut client, chunk_frame(b"<p>more</p>"))
+        .await
+        .expect("a trickling upload should be ended by the upload timeout");
+    assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+    assert!(
+        status.message().contains("upload"),
+        "the status should say it was the upload's length: {}",
+        status.message()
+    );
+    assert!(
+        took >= std::time::Duration::from_millis(500),
+        "ended after {took:?}"
+    );
+}
+
 /// Past the concurrent-stream cap, a call is refused before a byte is read.
 #[tokio::test]
 async fn streams_past_the_concurrency_cap_fail_fast() {
@@ -1562,5 +1698,860 @@ async fn streams_past_the_concurrency_cap_fail_fast() {
     assert!(
         reopened.is_some(),
         "the permit should be released when the first stream ends"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Clients that stop reading
+// ---------------------------------------------------------------------------
+
+/// The options frame.
+fn options_frame(options: pb::ExtractOptions) -> pb::ExtractRequest {
+    pb::ExtractRequest {
+        frame: Some(pb::extract_request::Frame::Options(options)),
+    }
+}
+
+/// One chunk of document bytes.
+fn chunk_frame(bytes: &[u8]) -> pb::ExtractRequest {
+    pb::ExtractRequest {
+        frame: Some(pb::extract_request::Frame::Chunk(bytes.to_vec())),
+    }
+}
+
+/// `bytes` of `<a x="1">`, repeated: one matched element every nine bytes.
+fn anchors(bytes: usize) -> Vec<u8> {
+    b"<a x=\"1\">".iter().copied().cycle().take(bytes).collect()
+}
+
+/// Options matching every anchor, with its tag and attributes.
+fn every_anchor() -> pb::ExtractOptions {
+    pb::ExtractOptions {
+        rules: vec![pb::ExtractRule {
+            id: "a".to_owned(),
+            selector: "a".to_owned(),
+            captures: vec![pb::Capture::TagName as i32, pb::Capture::Attributes as i32],
+        }],
+        ..Default::default()
+    }
+}
+
+/// A client that uploads the whole document before it reads anything gets a
+/// status it can act on, instead of a hang.
+///
+/// That client used to wedge the server for good. The outbound buffer filled,
+/// the server stopped reading the upload, the upload blocked on the full
+/// HTTP/2 window, and neither side moved again until the client's own
+/// deadline, with a stream slot held throughout. Now the server gives up
+/// after the send timeout, keeps reading the upload so the client can finish
+/// it, and the client's first read ends in `RESOURCE_EXHAUSTED`, never OK.
+#[tokio::test]
+async fn a_client_that_reads_only_after_uploading_gets_resource_exhausted_not_a_hang() {
+    let mut client = start_server_with_client_window(
+        LolHtmlGrpc::new()
+            .with_outbound_buffer_bytes(64 * 1024)
+            .with_send_timeout(std::time::Duration::from_secs(1))
+            .into_service(),
+        64 * 1024,
+    )
+    .await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tx.send(options_frame(every_anchor())).await.unwrap();
+    let mut stream = client
+        .extract(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .expect("open the call")
+        .into_inner();
+
+    // Twice the server's 1 MiB receive window, and hundreds of thousands of
+    // events, far more than every buffer between the parse and this client
+    // holds: the upload cannot finish unless the server keeps reading it.
+    let document = anchors(2 << 20);
+    let upload = async move {
+        for chunk in document.chunks(64 * 1024) {
+            tx.send(chunk_frame(chunk)).await.unwrap();
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), upload)
+        .await
+        .expect("the upload must be able to finish without the client reading");
+
+    let mut events = 0;
+    let status = loop {
+        match stream.message().await {
+            Ok(Some(_)) => events += 1,
+            Ok(None) => {
+                panic!("the call ended OK after {events} events, though nobody read in time")
+            }
+            Err(status) => break status,
+        }
+    };
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert!(
+        status.message().contains("while uploading"),
+        "the status should say what to do: {}",
+        status.message()
+    );
+}
+
+/// A client that reads only after uploading still gets the real result of a
+/// parse that ended early, and gets it without waiting.
+///
+/// A parse that ends partway through the upload, here on a text node over
+/// the memory limit, with more output queued than the transport will take
+/// from a client that is not reading, used to stop reading the upload until
+/// the send timeout passed. The client, blocked on its write, never got to
+/// its read, so the in-band error or the bail-out was thrown away and
+/// replaced by `RESOURCE_EXHAUSTED` a send timeout later. Now the rest of the
+/// upload is read and dropped while the result waits.
+#[tokio::test]
+async fn an_early_ending_reaches_a_client_that_reads_only_after_uploading() {
+    let send_timeout = std::time::Duration::from_secs(5);
+    let client = start_server_with_client_window(
+        LolHtmlGrpc::new()
+            .with_outbound_buffer_bytes(64 << 20)
+            .with_send_timeout(send_timeout)
+            .into_service(),
+        64 * 1024,
+    )
+    .await;
+
+    // Fifty thousand void elements, far more output than the client's window
+    // and the transport's buffers hold, then a text node that outgrows the
+    // 64 KiB limit, then megabytes more: several times the server's receive
+    // window, which can only be sent if the server keeps reading after the
+    // parse has ended.
+    let images = 50_000;
+    let mut document = b"<img x=\"1\">".repeat(images);
+    document.extend_from_slice(b"<p>");
+    document.extend("word ".repeat(1 << 20).bytes());
+
+    for graceful_bail_out in [false, true] {
+        let mut options = paragraph_text(pb::MemoryLimits {
+            graceful_bail_out,
+            ..Default::default()
+        });
+        options.rules.push(pb::ExtractRule {
+            id: "img".to_owned(),
+            selector: "img".to_owned(),
+            captures: vec![pb::Capture::TagName as i32, pb::Capture::Attributes as i32],
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(options_frame(options)).await.unwrap();
+        let started = std::time::Instant::now();
+        let mut stream = client
+            .clone()
+            .extract(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .expect("open the call")
+            .into_inner();
+
+        // Chunks well inside the memory limit, which the parser's own input
+        // buffer counts against.
+        let chunks = document.clone();
+        let upload = async move {
+            for chunk in chunks.chunks(16 * 1024) {
+                tx.send(chunk_frame(chunk)).await.unwrap();
+            }
+        };
+        tokio::time::timeout(send_timeout / 2, upload)
+            .await
+            .expect("the upload must be able to finish after the parse has ended");
+
+        let mut events = Vec::new();
+        while let Some(event) = stream
+            .message()
+            .await
+            .unwrap_or_else(|status| panic!("bail out {graceful_bail_out}: {status:?}"))
+        {
+            events.push(event);
+        }
+        assert!(
+            started.elapsed() < send_timeout,
+            "the result took {:?}",
+            started.elapsed()
+        );
+        let delivered = only!(events, Event::Element)
+            .iter()
+            .filter(|element| element.rule_id == "img")
+            .count();
+        assert_eq!(delivered, images, "every queued event still goes out");
+        if graceful_bail_out {
+            let finished = only!(events, Event::Finished);
+            assert_eq!(finished.len(), 1);
+            assert!(finished[0].bailed_out);
+        } else {
+            let errors = only!(events, Event::Error);
+            assert_eq!(errors.len(), 1);
+            assert_eq!(
+                errors[0].code,
+                pb::ParseErrorCode::MemoryLimitExceeded as i32,
+                "{}",
+                errors[0].message
+            );
+        }
+    }
+}
+
+/// A call that never sends its options frame does not hold its stream slot
+/// past the idle timeout.
+///
+/// The slot is taken before the options frame is read, and that read used
+/// to have no deadline, so clients that opened calls and sent nothing could
+/// hold every slot for as long as they liked.
+#[tokio::test]
+async fn a_call_that_never_sends_options_gives_its_slot_back() {
+    let client = start_configured_server(
+        LolHtmlGrpc::new()
+            .with_max_concurrent_streams(1)
+            .with_idle_timeout(std::time::Duration::from_millis(300))
+            .into_service(),
+    )
+    .await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<pb::ExtractRequest>(1);
+    let silent = {
+        let mut client = client.clone();
+        tokio::spawn(async move {
+            client
+                .extract(tokio_stream::wrappers::ReceiverStream::new(rx))
+                .await
+        })
+    };
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), silent)
+        .await
+        .expect("a silent call should be ended by the server")
+        .unwrap()
+        .expect_err("a call with no options frame cannot open");
+    assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+    assert!(
+        status.message().contains("options"),
+        "the status should say what was missing: {}",
+        status.message()
+    );
+    drop(tx);
+
+    // The only slot is free again.
+    let events = extract(&client, b"<a x=\"1\">", every_anchor(), 64)
+        .await
+        .expect("the slot should be free once the silent call has ended");
+    assert!(matches!(
+        events.last().and_then(|e| e.event.as_ref()),
+        Some(Event::Finished(_))
+    ));
+}
+
+/// A client that never reads does not get to keep its stream slot.
+///
+/// With room for one stream, a second client's call is refused while the
+/// first is live, and is accepted once the first client has taken nothing
+/// for the send timeout, though it neither reads nor closes its call. The
+/// two are on separate connections, as separate clients are: on a shared one
+/// the unread stream would fill the connection's own flow-control window and
+/// starve the other of data, which is HTTP/2's doing and not the server's.
+#[tokio::test]
+async fn a_client_that_never_reads_gives_its_stream_slot_back() {
+    let addr = serve(
+        LolHtmlGrpc::new()
+            .with_max_concurrent_streams(1)
+            .with_outbound_buffer_bytes(16 * 1024)
+            .with_send_timeout(std::time::Duration::from_millis(200))
+            .into_service(),
+    )
+    .await;
+    let mut stuck = connect_with_window(addr, 64 * 1024).await;
+    let client = connect_with_window(addr, 1 << 20).await;
+
+    // Small enough to upload in full, dense enough that its events overflow
+    // every buffer between the parse and a client that is not reading.
+    let mut frames = vec![options_frame(every_anchor())];
+    frames.extend(anchors(512 * 1024).chunks(64 * 1024).map(chunk_frame));
+    let unread = stuck
+        .extract(tokio_stream::iter(frames))
+        .await
+        .expect("the first call opens")
+        .into_inner();
+
+    let refused = extract(&client, b"<a>", every_anchor(), 64)
+        .await
+        .expect_err("the only slot is taken");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+
+    let mut accepted = None;
+    for _ in 0..100 {
+        match extract(&client, b"<a x=\"1\">", every_anchor(), 64).await {
+            Ok(events) => {
+                accepted = Some(events);
+                break;
+            }
+            Err(status) => assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let events = accepted.expect("the slot should come back once the first client stopped reading");
+    assert!(matches!(
+        events.last().and_then(|e| e.event.as_ref()),
+        Some(Event::Finished(_))
+    ));
+    drop(unread);
+}
+
+/// A client that finishes its upload and never reads keeps its stream slot
+/// only for the send timeout after the parse ends, not until it reads.
+///
+/// The parse of a small upload finishes with all of its events queued, well
+/// inside the default outbound buffer, so it never waits for room. What is
+/// left is the wait for the client to take the result, and that wait has to
+/// hold the slot, since the queued events are the memory the slot accounts
+/// for, and then give up: a second client is refused while it lasts and
+/// accepted once the send timeout has passed, and the first client, when it
+/// does read, finds the call ended rather than its discarded events.
+///
+/// The second client tries halfway through the send timeout, by when the
+/// parse of a few thousand elements has long finished, so the refusal is the
+/// wait's and not the parse's.
+#[tokio::test]
+async fn a_client_that_never_reads_its_result_gives_the_slot_back_after_the_parse() {
+    let send_timeout = std::time::Duration::from_millis(400);
+    let addr = serve(
+        LolHtmlGrpc::new()
+            .with_max_concurrent_streams(1)
+            .with_send_timeout(send_timeout)
+            .into_service(),
+    )
+    .await;
+    let mut stuck = connect_with_window(addr, 16 * 1024).await;
+    let client = connect_with_window(addr, 1 << 20).await;
+
+    // Over 100 KiB of events, several times what the client's window and the
+    // server's send buffer hold, so the result cannot reach the client
+    // without its reading, and about a MiB charged, far less than the
+    // buffer, so the parse never waits.
+    let mut frames = vec![options_frame(every_anchor())];
+    frames.extend(anchors(40 * 1024).chunks(16 * 1024).map(chunk_frame));
+    let mut unread = stuck
+        .extract(tokio_stream::iter(frames))
+        .await
+        .expect("the first call opens")
+        .into_inner();
+
+    tokio::time::sleep(send_timeout / 2).await;
+    let refused = extract(&client, b"<a>", every_anchor(), 64)
+        .await
+        .expect_err("the slot is held while the result waits for the client");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+
+    let started = std::time::Instant::now();
+    let mut accepted = false;
+    while started.elapsed() < std::time::Duration::from_secs(1) {
+        match extract(&client, b"<a x=\"1\">", every_anchor(), 64).await {
+            Ok(_) => {
+                accepted = true;
+                break;
+            }
+            Err(status) => assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        accepted,
+        "the slot should come back within a second of the send timeout"
+    );
+
+    let mut events = 0;
+    let status = loop {
+        match unread.message().await {
+            Ok(Some(_)) => events += 1,
+            Ok(None) => panic!("the call ended OK after {events} events, though it was ended"),
+            Err(status) => break status,
+        }
+    };
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert!(
+        events < 40 * 1024 / 9,
+        "only what the transport already held should arrive, got {events} events"
+    );
+}
+
+/// A TCP proxy to `upstream` that passes requests through untouched and
+/// responses at `bytes_per_second`, the way a client on a slow link reads.
+async fn throttling_proxy(
+    upstream: std::net::SocketAddr,
+    bytes_per_second: usize,
+) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let server = tokio::net::TcpStream::connect(upstream)
+                .await
+                .expect("connect upstream");
+            let (mut client_read, mut client_write) = client.into_split();
+            let (mut server_read, mut server_write) = server.into_split();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut client_read, &mut server_write).await;
+            });
+            tokio::spawn(async move {
+                let mut buffer = vec![0; 8 * 1024];
+                loop {
+                    let n = match server_read.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    if client_write.write_all(&buffer[..n]).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(
+                        n as f64 / bytes_per_second as f64,
+                    ))
+                    .await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// A client reading one large event slowly is still reading.
+///
+/// The client takes no other event until it has read the one in flight, so
+/// a text node that takes longer to read than the send timeout used to look
+/// like a client that had stopped, and a reader keeping up at 160 KiB/s got
+/// `RESOURCE_EXHAUSTED` partway through its result. The send timeout now
+/// allows for the last event taken to be read at the slowest rate a client
+/// is held to.
+///
+/// Each text node takes about 0.8 s to cross the proxy, four times the send
+/// timeout and well inside what it is extended by. The client's small window
+/// keeps the server from running ahead of the proxy into its buffers; the
+/// last node is still in flight when the parse ends, so the wait for the
+/// result is covered as well as the wait for room.
+#[tokio::test]
+async fn a_client_slowly_reading_one_large_event_is_not_taken_for_one_that_stopped() {
+    let server = serve(
+        LolHtmlGrpc::new()
+            .with_outbound_buffer_bytes(64 * 1024)
+            .with_send_timeout(std::time::Duration::from_millis(200))
+            .into_service(),
+    )
+    .await;
+    let proxy = throttling_proxy(server, 160 * 1024).await;
+    let client = connect_with_window(proxy, 64 * 1024).await;
+
+    let node = "t".repeat(128 * 1024);
+    let document = format!("<p>{node}</p>").repeat(3);
+    let options = pb::ExtractOptions {
+        rules: vec![pb::ExtractRule {
+            id: "p".to_owned(),
+            selector: "p".to_owned(),
+            captures: vec![pb::Capture::Text as i32],
+        }],
+        ..Default::default()
+    };
+
+    let events = extract(&client, document.as_bytes(), options, 64 * 1024)
+        .await
+        .expect("a client that keeps reading must get its whole result");
+    let texts = only!(events, Event::Text);
+    assert_eq!(texts.len(), 3);
+    assert!(texts.iter().all(|text| text.text == node));
+    assert!(matches!(
+        events.last().and_then(|e| e.event.as_ref()),
+        Some(Event::Finished(_))
+    ));
+}
+
+/// Backpressure inside one chunk is invisible to a client that reads.
+///
+/// With an outbound buffer far smaller than one chunk's events, the parse
+/// stops mid-chunk to wait for the client over and over. The stream that
+/// comes out must still be identical, event for event, to the one the
+/// default buffer produces.
+#[tokio::test]
+async fn backpressure_inside_a_chunk_changes_nothing_a_reading_client_sees() {
+    let roomy = start_server().await;
+    let tight = start_configured_server(
+        LolHtmlGrpc::new()
+            .with_outbound_buffer_bytes(16 * 1024)
+            .into_service(),
+    )
+    .await;
+
+    let mut document = Vec::new();
+    for n in 0..20_000 {
+        document.extend_from_slice(
+            format!("<p id=\"p{n}\" class=\"c\">paragraph {n} &amp; more</p><!-- {n} -->")
+                .as_bytes(),
+        );
+    }
+
+    for chunk_size in [64 * 1024, usize::MAX] {
+        let expected = extract(&roomy, &document, everything(), chunk_size)
+            .await
+            .expect("the default buffer");
+        let actual = extract(&tight, &document, everything(), chunk_size)
+            .await
+            .expect("the tight buffer");
+        assert!(
+            expected.len() > 50_000,
+            "the document should produce many events, got {}",
+            expected.len()
+        );
+        assert!(
+            expected == actual,
+            "at chunk size {chunk_size} the tight buffer produced a different stream \
+             ({} events against {})",
+            actual.len(),
+            expected.len()
+        );
+    }
+}
+
+/// One large chunk is one long parse, and it must not happen where it holds
+/// up everything else.
+///
+/// This test's runtime has a single thread, which the server and every
+/// client call share. A parse on that thread would leave a call made
+/// mid-parse waiting until the parse was done; on the blocking pool the call
+/// is answered while the parse is still going.
+#[tokio::test]
+async fn a_large_chunk_is_parsed_without_holding_up_other_calls() {
+    let client = start_server().await;
+
+    // Expensive to parse and cheap to send: every element is checked against
+    // every rule, and none of them ever matches, so nothing comes back.
+    let rules: Vec<pb::ExtractRule> = (0..64)
+        .map(|n| pb::ExtractRule {
+            id: format!("r{n}"),
+            selector: format!("section.s{n} article[data-k{n}] > span.t{n}"),
+            captures: vec![pb::Capture::TagName as i32],
+        })
+        .collect();
+    let options = pb::ExtractOptions {
+        rules,
+        ..Default::default()
+    };
+    // An optimized build parses an order of magnitude faster, and the
+    // Dockerfile runs this suite as one, so the document grows to keep the
+    // parse long enough to measure against.
+    let size = if cfg!(debug_assertions) {
+        8 << 20
+    } else {
+        32 << 20
+    };
+    let mut document = Vec::with_capacity(size + 64);
+    while document.len() < size {
+        document.extend_from_slice(b"<div class=\"a\"><span data-x=\"1\">text</span></div>");
+    }
+
+    let parse = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let events = extract(&client, &document, options, usize::MAX)
+                .await
+                .expect("extract");
+            assert!(matches!(
+                events.last().and_then(|e| e.event.as_ref()),
+                Some(Event::Finished(_))
+            ));
+            started.elapsed()
+        })
+    };
+
+    let mut probes = 0;
+    let mut slowest = std::time::Duration::ZERO;
+    while !parse.is_finished() {
+        let started = std::time::Instant::now();
+        client
+            .clone()
+            .validate_selectors(pb::ValidateSelectorsRequest {
+                rules: vec![rule("probe", "p")],
+            })
+            .await
+            .expect("a probe call");
+        slowest = slowest.max(started.elapsed());
+        probes += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let total = parse.await.expect("the extract task");
+
+    println!("  extract took {total:?}; {probes} probe calls, the slowest {slowest:?}");
+    assert!(
+        total >= std::time::Duration::from_millis(100),
+        "the parse has to take long enough to measure anything against, took {total:?}"
+    );
+    assert!(
+        slowest < total / 4,
+        "a call made during the parse waited {slowest:?} of the extract's {total:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What one call may cost
+// ---------------------------------------------------------------------------
+
+/// The shape of a rule set is capped, and `ValidateSelectors` applies the same
+/// caps as `Extract`, so a set it passes is never refused for its size.
+#[tokio::test]
+async fn a_rule_set_over_the_shape_limits_is_refused_by_both_rpcs() {
+    use grpc_lol_html::rules::{MAX_RULES, MAX_SELECTOR_BYTES};
+
+    let client = start_server().await;
+    let too_many: Vec<_> = (0..=MAX_RULES)
+        .map(|n| rule(&format!("r{n}"), "p"))
+        .collect();
+    let too_long = vec![rule(
+        "long",
+        &format!("div{}", ".c".repeat(MAX_SELECTOR_BYTES)),
+    )];
+
+    for rules in [too_many, too_long] {
+        let err = extract(
+            &client,
+            b"<p>x</p>",
+            pb::ExtractOptions {
+                rules: rules.clone(),
+                ..Default::default()
+            },
+            64,
+        )
+        .await
+        .expect_err("Extract should refuse the rule set");
+        assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+
+        let err = client
+            .clone()
+            .validate_selectors(pb::ValidateSelectorsRequest { rules })
+            .await
+            .expect_err("ValidateSelectors should refuse it too");
+        assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    }
+
+    let at_the_cap: Vec<_> = (0..MAX_RULES)
+        .map(|n| rule(&format!("r{n}"), "p"))
+        .collect();
+    let events = extract(
+        &client,
+        b"<p>x</p>",
+        pb::ExtractOptions {
+            rules: at_the_cap,
+            ..Default::default()
+        },
+        64,
+    )
+    .await
+    .expect("a rule set at the cap is fine");
+    assert_eq!(
+        only!(events, Event::Started)[0].rule_count as usize,
+        MAX_RULES
+    );
+}
+
+/// The caller picks its memory limit, but the server caps it: asking for
+/// `u64::MAX` must not switch the parser's only memory guard off.
+#[tokio::test]
+async fn a_memory_limit_above_the_server_ceiling_is_cut_to_it() {
+    let greedy = pb::ExtractOptions {
+        limits: Some(pb::MemoryLimits {
+            max_bytes: u64::MAX,
+            ..Default::default()
+        }),
+        ..everything()
+    };
+
+    let capped = start_configured_server(
+        LolHtmlGrpc::new()
+            .with_max_memory_bytes(4096)
+            .into_service(),
+    )
+    .await;
+    let events = extract_file(&capped, "deep_nesting.html", greedy.clone(), 1024).await;
+    let errors = only!(events, Event::Error);
+    assert_eq!(
+        errors.len(),
+        1,
+        "the 4 KiB ceiling should have stopped the parse"
+    );
+    assert_eq!(
+        errors[0].code,
+        pb::ParseErrorCode::MemoryLimitExceeded as i32,
+        "{}",
+        errors[0].message
+    );
+
+    // The same request against the default ceiling gets through, so it was
+    // the ceiling, not the request, that stopped it above.
+    let roomy = start_server().await;
+    let events = extract_file(&roomy, "deep_nesting.html", greedy, 1024).await;
+    assert!(matches!(
+        events.last().and_then(|e| e.event.as_ref()),
+        Some(Event::Finished(_))
+    ));
+}
+
+/// A preallocation over the memory limit, including lol-html's own 1 KiB
+/// default under a limit below that, is clamped rather than handed to
+/// lol-html, which skips it silently in a release build and panics in a
+/// debug one, taking the call down without a result.
+#[tokio::test]
+async fn a_preallocation_over_the_memory_limit_does_not_break_the_call() {
+    let client = start_server().await;
+    for limits in [
+        pb::MemoryLimits {
+            max_bytes: 4096,
+            preallocated_buffer_bytes: 1 << 30,
+            graceful_bail_out: false,
+        },
+        pb::MemoryLimits {
+            max_bytes: 512,
+            ..Default::default()
+        },
+    ] {
+        let events = extract_file(
+            &client,
+            "doctype_legacy.html",
+            pb::ExtractOptions {
+                limits: Some(limits),
+                ..everything()
+            },
+            64,
+        )
+        .await;
+        assert!(
+            matches!(
+                events.last().and_then(|e| e.event.as_ref()),
+                Some(Event::Finished(_) | Event::Error(_))
+            ),
+            "the call must end with a result, not a dropped stream ({limits:?}): {:?}",
+            events.last()
+        );
+    }
+}
+
+/// Options capturing the text of every `<p>` under a 64 KiB memory limit.
+fn paragraph_text(limits: pb::MemoryLimits) -> pb::ExtractOptions {
+    pb::ExtractOptions {
+        rules: vec![pb::ExtractRule {
+            id: "p".to_owned(),
+            selector: "p".to_owned(),
+            captures: vec![pb::Capture::Text as i32],
+        }],
+        limits: Some(pb::MemoryLimits {
+            max_bytes: 64 * 1024,
+            ..limits
+        }),
+        ..Default::default()
+    }
+}
+
+/// Text is reassembled into whole nodes before it is sent, and the text held
+/// meanwhile counts against the call's memory limit, which lol-html's own
+/// accounting never sees. One long text node used to grow the server without
+/// bound; now it ends the run the way any memory-limit overrun does.
+#[tokio::test]
+async fn a_text_node_longer_than_the_memory_limit_ends_the_run_in_band() {
+    let client = start_server().await;
+    let text = "word ".repeat(200_000);
+    let document = format!("<p>{text}</p><p>after</p>");
+
+    let events = extract(
+        &client,
+        document.as_bytes(),
+        paragraph_text(pb::MemoryLimits::default()),
+        16 * 1024,
+    )
+    .await
+    .expect("the call itself succeeds");
+    let errors = only!(events, Event::Error);
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].code,
+        pb::ParseErrorCode::MemoryLimitExceeded as i32,
+        "{}",
+        errors[0].message
+    );
+    assert!(
+        errors[0].message.contains("raw_text_chunks"),
+        "the error should name the way out: {}",
+        errors[0].message
+    );
+    assert!(
+        only!(events, Event::Text).is_empty(),
+        "no piece of the node may be passed off as the whole of it"
+    );
+
+    // Graceful bail-out turns it into a truncated success that says so.
+    let events = extract(
+        &client,
+        document.as_bytes(),
+        paragraph_text(pb::MemoryLimits {
+            graceful_bail_out: true,
+            ..Default::default()
+        }),
+        16 * 1024,
+    )
+    .await
+    .expect("the call itself succeeds");
+    let finished = only!(events, Event::Finished);
+    assert_eq!(finished.len(), 1);
+    assert!(finished[0].bailed_out);
+    assert!(finished[0].bail_out_reason.contains("reassembled"));
+
+    // Raw fragments are never held, so the same node streams through whole.
+    let events = extract(
+        &client,
+        document.as_bytes(),
+        pb::ExtractOptions {
+            raw_text_chunks: true,
+            ..paragraph_text(pb::MemoryLimits::default())
+        },
+        16 * 1024,
+    )
+    .await
+    .expect("the call itself succeeds");
+    let fragments = only!(events, Event::Text);
+    let end = fragments
+        .iter()
+        .position(|fragment| fragment.last_in_node)
+        .expect("the first node ends");
+    let first: String = fragments[..=end].iter().map(|f| f.text.as_str()).collect();
+    assert_eq!(first, text);
+    let finished = only!(events, Event::Finished);
+    assert!(!finished[0].bailed_out);
+}
+
+/// The limit is on the text held across all of a call's rules, not per
+/// rule: two rules capturing the same node hold it twice.
+#[tokio::test]
+async fn text_held_for_reassembly_is_counted_across_rules() {
+    let client = start_server().await;
+    let document = format!("<p>{}</p>", "x".repeat(40 * 1024));
+
+    let one_rule = paragraph_text(pb::MemoryLimits::default());
+    let events = extract(&client, document.as_bytes(), one_rule.clone(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(only!(events, Event::Text).len(), 1, "40 KiB fits in 64 KiB");
+
+    let mut two_rules = one_rule;
+    two_rules.rules.push(pb::ExtractRule {
+        id: "again".to_owned(),
+        ..two_rules.rules[0].clone()
+    });
+    let events = extract(&client, document.as_bytes(), two_rules, 4096)
+        .await
+        .unwrap();
+    let errors = only!(events, Event::Error);
+    assert_eq!(errors.len(), 1, "two copies of 40 KiB do not fit in 64 KiB");
+    assert_eq!(
+        errors[0].code,
+        pb::ParseErrorCode::MemoryLimitExceeded as i32
     );
 }

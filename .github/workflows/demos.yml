@@ -1,0 +1,23 @@
+name: Demos
+
+# The demo clients are examples to copy rather than products, but they compile
+# against the contract in proto/, and a contract change or a dependency bump
+# that breaks one should fail here rather than in the hands of whoever copies
+# it. The Java client also carries a test, holding it to its call deadlines.
+on: [ push, pull_request ]
+
+jobs:
+  java:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install a JDK
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '21'
+    # The wrapper checks the Gradle distribution against the checksum pinned
+    # in gradle-wrapper.properties before it runs anything.
+    - name: Build and test the Java client
+      working-directory: demos/java-client
+      run: ./gradlew --no-daemon --console=plain build

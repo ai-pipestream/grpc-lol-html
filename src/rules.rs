@@ -28,6 +28,26 @@ pub const DEFAULT_DOCUMENT_RULE_ID: &str = "document";
 /// `<script>` and `<style>`, has to be asked for by name.
 pub const DEFAULT_TEXT_TYPES: [pb::TextType; 2] = [pb::TextType::Data, pb::TextType::Rcdata];
 
+/// Most rules one call may carry.
+///
+/// Every rule is matched against every element and every match is its own
+/// event, so the rule count multiplies both the parse's CPU and its output.
+/// Unbounded, one options frame of `*` rules turns a modest document into
+/// billions of events.
+pub const MAX_RULES: usize = 256;
+
+/// Longest rule or document-rule id accepted, in bytes.
+///
+/// The id is copied onto every event its rule produces, so a long one is
+/// paid for once per match rather than once per call.
+pub const MAX_RULE_ID_BYTES: usize = 256;
+
+/// Longest selector accepted, in bytes. Real selectors are a few dozen.
+pub const MAX_SELECTOR_BYTES: usize = 4096;
+
+/// What lol-html preallocates for its parsing buffer when told nothing.
+const LOL_HTML_PREALLOCATED_BYTES: usize = 1024;
+
 /// One rule with its selector already compiled.
 pub struct CompiledRule {
     /// Caller-chosen id, echoed on every event this rule produces.
@@ -62,11 +82,12 @@ pub struct CompiledOptions {
     pub strict: bool,
     /// Whether to treat ESI tags as elements.
     pub enable_esi_tags: bool,
-    /// Hard cap on parser-buffered state.
+    /// Hard cap on parser-buffered state, and separately on text held for
+    /// reassembly. Already clamped to the server's ceiling.
     pub max_memory_bytes: usize,
-    /// Bytes to preallocate for the parsing buffer, if the caller named a
-    /// size. `None` leaves lol-html's own default of 1 KiB.
-    pub preallocated_buffer_bytes: Option<usize>,
+    /// Bytes to preallocate for the parsing buffer: the caller's size, or
+    /// lol-html's default of 1 KiB, never more than [`Self::max_memory_bytes`].
+    pub preallocated_buffer_bytes: usize,
     /// Whether exceeding the memory cap ends the run gracefully rather than
     /// with a terminal error.
     pub graceful_bail_out: bool,
@@ -104,12 +125,15 @@ impl CompiledOptions {
     ///
     /// Rebuilt rather than stored because `MemorySettings` is `#[repr(C)]`
     /// for the C API and derives neither `Clone` nor `Copy`.
+    ///
+    /// The preallocation is always set explicitly, because lol-html's own
+    /// default of 1 KiB is itself over a limit below 1 KiB. A preallocation
+    /// over the limit is skipped without a word in a release build and trips
+    /// a `debug_assert!` that kills the call in a debug one.
     pub fn memory_settings(&self) -> MemorySettings {
-        let mut settings =
-            MemorySettings::new().with_max_allowed_memory_usage(self.max_memory_bytes);
-        if let Some(preallocated) = self.preallocated_buffer_bytes {
-            settings = settings.with_preallocated_parsing_buffer_size(preallocated);
-        }
+        let mut settings = MemorySettings::new()
+            .with_max_allowed_memory_usage(self.max_memory_bytes)
+            .with_preallocated_parsing_buffer_size(self.preallocated_buffer_bytes);
         if self.graceful_bail_out {
             settings = settings.with_graceful_bail_out_on_memory_limit_exceeded(true);
         }
@@ -119,11 +143,29 @@ impl CompiledOptions {
 
 /// Compile and validate a request's options.
 ///
+/// `memory_ceiling` is the server's cap on a call's memory limit: a request
+/// asking for more gets the ceiling, and one asking for nothing gets the
+/// default or the ceiling, whichever is lower.
+///
 /// # Errors
 ///
-/// Returns `INVALID_ARGUMENT` for an empty rule set, a rule with no captures,
-/// a selector that does not compile, or an encoding lol-html cannot tokenize.
-pub fn compile(options: &pb::ExtractOptions) -> Result<CompiledOptions, Status> {
+/// Returns `INVALID_ARGUMENT` for an empty rule set, a rule set over the
+/// shape limits (see [`check_rule_set`]), a rule with no captures, a selector
+/// that does not compile, or an encoding lol-html cannot tokenize.
+pub fn compile(
+    options: &pb::ExtractOptions,
+    memory_ceiling: usize,
+) -> Result<CompiledOptions, Status> {
+    check_rule_set(&options.rules)?;
+    if let Some(doc) = &options.document_rule
+        && doc.id.len() > MAX_RULE_ID_BYTES
+    {
+        return Err(Status::invalid_argument(format!(
+            "the document_rule id is {} bytes; ids may be at most {MAX_RULE_ID_BYTES} bytes",
+            doc.id.len()
+        )));
+    }
+
     let document = options.document_rule.as_ref().and_then(|doc| {
         // A document rule that asks for nothing is the same as none at all.
         (doc.doctype || doc.comments || doc.text).then(|| DocumentScope {
@@ -159,6 +201,8 @@ pub fn compile(options: &pb::ExtractOptions) -> Result<CompiledOptions, Status> 
         doc
     });
 
+    let max_memory_bytes = max_memory_bytes(options.limits.as_ref(), memory_ceiling);
+
     Ok(CompiledOptions {
         rules,
         document,
@@ -168,13 +212,11 @@ pub fn compile(options: &pb::ExtractOptions) -> Result<CompiledOptions, Status> 
         // so that the proto3 zero value is the safe one.
         strict: !options.allow_ambiguous_markup,
         enable_esi_tags: options.enable_esi_tags,
-        max_memory_bytes: max_memory_bytes(options.limits.as_ref()),
-        preallocated_buffer_bytes: options
-            .limits
-            .as_ref()
-            .map(|limits| limits.preallocated_buffer_bytes)
-            .filter(|size| *size > 0)
-            .map(|size| usize::try_from(size).unwrap_or(usize::MAX)),
+        max_memory_bytes,
+        preallocated_buffer_bytes: preallocated_buffer_bytes(
+            options.limits.as_ref(),
+            max_memory_bytes,
+        ),
         graceful_bail_out: options
             .limits
             .as_ref()
@@ -182,6 +224,46 @@ pub fn compile(options: &pb::ExtractOptions) -> Result<CompiledOptions, Status> 
         raw_text_chunks: options.raw_text_chunks,
         text_types: text_types(&options.text_types),
     })
+}
+
+/// Check a rule set against the limits on its shape: at most [`MAX_RULES`]
+/// rules, ids of at most [`MAX_RULE_ID_BYTES`] and selectors of at most
+/// [`MAX_SELECTOR_BYTES`].
+///
+/// Shared by `Extract` and `ValidateSelectors`, so a rule set the second
+/// accepts is never refused by the first for its size.
+///
+/// # Errors
+///
+/// Returns `INVALID_ARGUMENT` naming the first limit exceeded.
+pub fn check_rule_set(rules: &[pb::ExtractRule]) -> Result<(), Status> {
+    if rules.len() > MAX_RULES {
+        return Err(Status::invalid_argument(format!(
+            "{} rules; a call may carry at most {MAX_RULES}. Every rule is matched against \
+             every element, so split a larger set across calls.",
+            rules.len()
+        )));
+    }
+
+    for (index, rule) in rules.iter().enumerate() {
+        // The id is not echoed: it is the thing that is too long.
+        if rule.id.len() > MAX_RULE_ID_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "rule {index} has an id of {} bytes; ids may be at most {MAX_RULE_ID_BYTES} bytes",
+                rule.id.len()
+            )));
+        }
+        if rule.selector.len() > MAX_SELECTOR_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "rule `{}` has a selector of {} bytes; selectors may be at most \
+                 {MAX_SELECTOR_BYTES} bytes",
+                rule.id,
+                rule.selector.len()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Compile one rule, mapping its captures onto flags.
@@ -251,20 +333,39 @@ fn resolve_encoding(label: &str) -> Result<AsciiCompatibleEncoding, Status> {
     })
 }
 
-/// Resolve the memory cap, applying our own default.
+/// Resolve the memory cap, applying our own default and the server's ceiling.
 ///
 /// lol-html defaults `max_allowed_memory_usage` to `usize::MAX`. A server
 /// taking documents off the open web must not run that way, so an unset or
-/// zero limit becomes [`DEFAULT_MAX_MEMORY_BYTES`] rather than infinity.
-fn max_memory_bytes(limits: Option<&pb::MemoryLimits>) -> usize {
+/// zero limit becomes [`DEFAULT_MAX_MEMORY_BYTES`] rather than infinity. And
+/// the caller does not get the last word: a limit above `ceiling` is cut to
+/// it, or any caller could switch the only parser memory guard off by asking
+/// for `u64::MAX`.
+fn max_memory_bytes(limits: Option<&pb::MemoryLimits>, ceiling: usize) -> usize {
     let max = limits
         .map(|limits| limits.max_bytes)
         .filter(|max| *max > 0)
         .unwrap_or(DEFAULT_MAX_MEMORY_BYTES);
-    usize::try_from(max).unwrap_or(usize::MAX)
+    usize::try_from(max).unwrap_or(usize::MAX).min(ceiling)
 }
 
-/// Default cap on parser-buffered state, when a request names none.
+/// Resolve the parsing-buffer preallocation, never above the memory cap.
+///
+/// lol-html charges the preallocation against the same limit, so one larger
+/// than the limit cannot be honoured: release builds skip it silently and
+/// debug builds panic. Clamping keeps the request meaningful in both.
+fn preallocated_buffer_bytes(limits: Option<&pb::MemoryLimits>, max_memory_bytes: usize) -> usize {
+    limits
+        .map(|limits| limits.preallocated_buffer_bytes)
+        .filter(|size| *size > 0)
+        .map_or(LOL_HTML_PREALLOCATED_BYTES, |size| {
+            usize::try_from(size).unwrap_or(usize::MAX)
+        })
+        .min(max_memory_bytes)
+}
+
+/// Default cap on parser-buffered state, when a request names none, and the
+/// default for the server's ceiling on what a request may name.
 ///
 /// Generous enough that no conforming document reaches it, small enough that a
 /// crafted one cannot exhaust the host.
@@ -321,12 +422,27 @@ mod tests {
         }
     }
 
+    /// The server ceiling the tests compile under, unless they are about it.
+    const CEILING: usize = DEFAULT_MAX_MEMORY_BYTES as usize;
+
     /// `CompiledOptions` holds a `Selector`, which is not `Debug`, so
     /// `unwrap_err` is unavailable here.
     fn rejection(options: &pb::ExtractOptions) -> Status {
-        match compile(options) {
+        match compile(options, CEILING) {
             Ok(_) => panic!("expected the request to be rejected"),
             Err(err) => err,
+        }
+    }
+
+    fn compiled(options: &pb::ExtractOptions, ceiling: usize) -> CompiledOptions {
+        compile(options, ceiling).unwrap_or_else(|err| panic!("rejected: {err}"))
+    }
+
+    fn with_limits(limits: pb::MemoryLimits) -> pb::ExtractOptions {
+        pb::ExtractOptions {
+            rules: vec![rule("a", "div")],
+            limits: Some(limits),
+            ..Default::default()
         }
     }
 
@@ -437,14 +553,132 @@ mod tests {
 
     #[test]
     fn an_unset_memory_limit_is_capped_rather_than_infinite() {
-        assert_eq!(max_memory_bytes(None), DEFAULT_MAX_MEMORY_BYTES as usize);
-        assert_ne!(max_memory_bytes(None), usize::MAX);
+        assert_eq!(
+            max_memory_bytes(None, usize::MAX),
+            DEFAULT_MAX_MEMORY_BYTES as usize
+        );
+        assert_ne!(max_memory_bytes(None, usize::MAX), usize::MAX);
 
         // A zero from the wire means "unset", not "no memory allowed".
         let zeroed = pb::MemoryLimits::default();
         assert_eq!(
-            max_memory_bytes(Some(&zeroed)),
+            max_memory_bytes(Some(&zeroed), usize::MAX),
             DEFAULT_MAX_MEMORY_BYTES as usize
+        );
+    }
+
+    /// The caller picks a limit, but not one above the server's ceiling, and
+    /// an unset limit is the default only when the ceiling allows it.
+    #[test]
+    fn the_server_ceiling_caps_whatever_limit_the_caller_asks_for() {
+        let greedy = with_limits(pb::MemoryLimits {
+            max_bytes: u64::MAX,
+            ..Default::default()
+        });
+        assert_eq!(compiled(&greedy, 1 << 20).max_memory_bytes, 1 << 20);
+
+        let modest = with_limits(pb::MemoryLimits {
+            max_bytes: 4096,
+            ..Default::default()
+        });
+        assert_eq!(compiled(&modest, 1 << 20).max_memory_bytes, 4096);
+
+        let unset = with_limits(pb::MemoryLimits::default());
+        assert_eq!(compiled(&unset, 1 << 20).max_memory_bytes, 1 << 20);
+        assert_eq!(
+            compiled(&unset, usize::MAX).max_memory_bytes,
+            DEFAULT_MAX_MEMORY_BYTES as usize
+        );
+    }
+
+    /// lol-html charges its preallocation against the same limit, so it is
+    /// never allowed past it, including lol-html's own unrequested 1 KiB.
+    #[test]
+    fn the_preallocation_never_exceeds_the_memory_limit() {
+        let oversized = with_limits(pb::MemoryLimits {
+            max_bytes: 4096,
+            preallocated_buffer_bytes: 1 << 30,
+            ..Default::default()
+        });
+        assert_eq!(
+            compiled(&oversized, CEILING).preallocated_buffer_bytes,
+            4096
+        );
+
+        let tiny_limit = with_limits(pb::MemoryLimits {
+            max_bytes: 512,
+            ..Default::default()
+        });
+        assert_eq!(
+            compiled(&tiny_limit, CEILING).preallocated_buffer_bytes,
+            512
+        );
+
+        let ordinary = with_limits(pb::MemoryLimits {
+            preallocated_buffer_bytes: 8192,
+            ..Default::default()
+        });
+        assert_eq!(compiled(&ordinary, CEILING).preallocated_buffer_bytes, 8192);
+        assert_eq!(
+            compiled(&with_limits(pb::MemoryLimits::default()), CEILING).preallocated_buffer_bytes,
+            LOL_HTML_PREALLOCATED_BYTES
+        );
+    }
+
+    #[test]
+    fn a_rule_set_over_the_cap_is_refused() {
+        let options = pb::ExtractOptions {
+            rules: (0..=MAX_RULES).map(|n| rule(&n.to_string(), "p")).collect(),
+            ..Default::default()
+        };
+        let err = rejection(&options);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("at most 256"), "{}", err.message());
+
+        let at_the_cap = pb::ExtractOptions {
+            rules: (0..MAX_RULES).map(|n| rule(&n.to_string(), "p")).collect(),
+            ..Default::default()
+        };
+        assert_eq!(compiled(&at_the_cap, CEILING).rules.len(), MAX_RULES);
+    }
+
+    #[test]
+    fn an_overlong_selector_or_id_is_refused() {
+        let long_selector = pb::ExtractOptions {
+            rules: vec![rule(
+                "r",
+                &format!("div{}", ".c".repeat(MAX_SELECTOR_BYTES)),
+            )],
+            ..Default::default()
+        };
+        let err = rejection(&long_selector);
+        assert!(err.message().contains("selector of"), "{}", err.message());
+
+        let long_id = pb::ExtractOptions {
+            rules: vec![rule(&"i".repeat(MAX_RULE_ID_BYTES + 1), "p")],
+            ..Default::default()
+        };
+        let err = rejection(&long_id);
+        assert!(err.message().contains("has an id of"), "{}", err.message());
+        assert!(
+            !err.message().contains("iiii"),
+            "the oversized id is not echoed back: {}",
+            err.message()
+        );
+
+        let long_document_id = pb::ExtractOptions {
+            document_rule: Some(pb::DocumentRule {
+                id: "d".repeat(MAX_RULE_ID_BYTES + 1),
+                doctype: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = rejection(&long_document_id);
+        assert!(
+            err.message().contains("document_rule id"),
+            "{}",
+            err.message()
         );
     }
 

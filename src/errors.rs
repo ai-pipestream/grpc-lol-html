@@ -13,10 +13,62 @@
 //!   available. That wildcard is the one path by which an unrecognized
 //!   lol-html failure can reach a client as `PARSE_ERROR_CODE_UNSPECIFIED`,
 //!   and it always carries lol-html's own message alongside.
+//!
+//! The server's own content handlers can stop a parse too, and say why with a
+//! [`HandlerStop`]. lol-html hands that back boxed inside
+//! `RewritingError::ContentHandlerError`, so it is matched by downcasting.
+
+use std::fmt;
 
 use lol_html::errors::{RewritingError, SelectorError};
 
 use crate::proto::v1 as pb;
+
+/// Why one of the server's own content handlers stopped the parse.
+#[derive(Debug)]
+pub enum HandlerStop {
+    /// The response stream is gone, so nothing more can be delivered.
+    ClientGone,
+    /// The client took nothing from the outbound queue for the whole send
+    /// timeout.
+    NotReading {
+        /// Bytes of events waiting when the server gave up.
+        queued_bytes: usize,
+    },
+    /// Text held for reassembly outgrew the call's memory limit.
+    TextOverLimit {
+        /// The limit it outgrew, in bytes.
+        limit_bytes: usize,
+    },
+}
+
+impl fmt::Display for HandlerStop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClientGone => f.write_str("the response stream is gone"),
+            Self::NotReading { queued_bytes } => write!(
+                f,
+                "the client stopped reading responses with {queued_bytes} bytes of events waiting"
+            ),
+            Self::TextOverLimit { limit_bytes } => write!(
+                f,
+                "a text node outgrew the {limit_bytes} byte memory limit while being reassembled; \
+                 set raw_text_chunks to receive enormous text nodes as fragments instead"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HandlerStop {}
+
+/// The [`HandlerStop`] behind a parse failure, if one of the server's own
+/// handlers caused it.
+pub fn handler_stop(err: &RewritingError) -> Option<&HandlerStop> {
+    match err {
+        RewritingError::ContentHandlerError(cause) => cause.downcast_ref::<HandlerStop>(),
+        _ => None,
+    }
+}
 
 /// Translate a selector compilation failure into its wire code, plus the
 /// offending character for the one variant that names one.
@@ -83,11 +135,15 @@ pub fn selector_diagnostic(
 /// errors, and the only number we could synthesize is how much had been
 /// uploaded when the failure surfaced, which moves with the caller's chunk
 /// size and so is not a locator at all.
+///
+/// Text outgrowing the memory limit during reassembly is reported as the
+/// memory-limit failure it is, even though it surfaces from a handler: the
+/// limit covers that text as well as lol-html's own buffers.
 pub fn stream_error(err: &RewritingError) -> pb::StreamError {
     use pb::ParseErrorCode as Code;
 
     let code = match err {
-        RewritingError::MemoryLimitExceeded(_) => Code::MemoryLimitExceeded,
+        _ if is_memory_limit(err) => Code::MemoryLimitExceeded,
         RewritingError::ParsingAmbiguity(_) => Code::ParsingAmbiguity,
         RewritingError::ContentHandlerError(_) => Code::ContentHandlerError,
         // `RewritingError` is `#[non_exhaustive]`; this arm is mandatory.
@@ -103,9 +159,11 @@ pub fn stream_error(err: &RewritingError) -> pb::StreamError {
 /// Whether a parse failure is the kind a graceful bail-out converts into a
 /// truncated-but-successful run rather than a terminal error.
 ///
-/// Only the memory limit is configurable that way. An ambiguity bail-out is
-/// always terminal, because continuing past it is precisely the thing strict
-/// mode exists to refuse.
-pub const fn is_memory_limit(err: &RewritingError) -> bool {
+/// Only the memory limit is configurable that way, whether lol-html's own
+/// buffers or the server's text reassembly outgrew it. An ambiguity bail-out
+/// is always terminal, because continuing past it is precisely the thing
+/// strict mode exists to refuse.
+pub fn is_memory_limit(err: &RewritingError) -> bool {
     matches!(err, RewritingError::MemoryLimitExceeded(_))
+        || matches!(handler_stop(err), Some(HandlerStop::TextOverLimit { .. }))
 }

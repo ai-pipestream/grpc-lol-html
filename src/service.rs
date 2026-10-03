@@ -6,70 +6,70 @@
 //! # Why this is not a one-liner
 //!
 //! lol-html's content handlers are plain synchronous `FnMut` closures. A tonic
-//! response stream is fed by `tx.send(event).await`. You cannot await inside a
-//! closure, and `Sender::blocking_send` inside the async runtime deadlocks the
-//! worker it is running on. The obvious escape, an unbounded channel from the
-//! handlers, throws away backpressure, which is the one property this service
-//! advertises.
+//! response stream is fed asynchronously. You cannot await inside a closure,
+//! and blocking inside one on an async worker stalls that worker, or on a
+//! single-threaded runtime deadlocks it outright. The obvious escape, an
+//! unbounded channel from the handlers, throws away backpressure, which is
+//! the one property this service advertises.
 //!
-//! So the handlers push into an unbounded [`tokio::sync::mpsc`], whose `send`
-//! is a plain synchronous call that never blocks, and [`drain`] empties that
-//! queue after every `rewriter.write()`, awaiting each forward onto the
-//! bounded outbound channel. Unbounded is safe precisely because the queue is
-//! drained every chunk, so it never holds more than one chunk's worth of
-//! events; the bounded outbound channel is where backpressure actually lives.
-//! Awaiting the drain is what stops the driver reading the next inbound
-//! chunk, so a slow client slows the parser rather than growing a queue
-//! behind it.
+//! So the parse never runs on an async worker. Every `write()` and the final
+//! `end()` run on tokio's blocking pool, and the handlers put events straight
+//! onto the call's [`outbound`] queue, which is bounded in bytes. A handler
+//! that finds it full waits, on its blocking thread, until the response
+//! stream takes something. That holds the parse still, which stops the
+//! driver reading the next inbound chunk, so a slow client slows the parser
+//! rather than growing a queue behind it, whatever the chunk size and however
+//! many rules match.
 //!
-//! The queue is tokio's rather than [`std::sync::mpsc`] for a narrow reason:
-//! `std`'s `Receiver` is `Send` but not `Sync`, so holding one across an
-//! `.await` makes the whole future non-`Send` and `tokio::spawn` rejects it.
+//! The blocking pool is also what makes a large chunk harmless to everyone
+//! else: it is one long parse on a thread nobody is waiting for, rather than
+//! seconds in which an async worker cannot answer health checks, send
+//! keepalives or move other streams.
 //!
-//! `write()` is CPU-bound but runs one bounded chunk at a time, so it runs
-//! inline on the async task rather than on the blocking pool. The cap on
-//! inbound chunk size is what makes that safe: one oversized chunk would be
-//! one long uninterruptible parse.
-//!
-//! Two caps keep one caller from pinning the process: an open stream that
-//! stops sending frames is ended with `DEADLINE_EXCEEDED` after the idle
-//! timeout, and the number of live streams is bounded by a semaphore, past
-//! which calls fail fast with `RESOURCE_EXHAUSTED`. Every finished stream
-//! logs its bytes, matches and duration on a per-stream `extract` span.
+//! Four limits keep one caller from pinning the process: an open stream that
+//! stops sending document bytes is ended with `DEADLINE_EXCEEDED` after the
+//! idle timeout, and one whose upload is still going after the upload
+//! timeout likewise; one whose client stops reading responses is ended with
+//! `RESOURCE_EXHAUSTED` after the send timeout; and the number of live
+//! streams is bounded by a semaphore, past which calls fail fast with
+//! `RESOURCE_EXHAUSTED`. Every finished stream logs its bytes, matches and
+//! duration on a per-stream `extract` span.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use lol_html::errors::RewritingError;
 use lol_html::html_content::{Comment, Doctype, EndTag, TextChunk};
 use lol_html::send::{DocumentContentHandlers, ElementContentHandlers, HtmlRewriter, Settings};
-use tokio::sync::{Semaphore, mpsc};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::Semaphore;
 use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument;
 
+use crate::errors::HandlerStop;
+use crate::outbound::{self, Delivery, Outbound, OutboundStream, SendError};
 use crate::proto::v1 as pb;
 use crate::rules::{CompiledOptions, CompiledRule};
 use crate::{convert, errors, rules};
 
-/// Events buffered on the outbound channel before the driver has to wait.
-const OUTBOUND_BUFFER: usize = 256;
-
 /// Largest single inbound chunk accepted, in bytes.
 ///
 /// Not a document size limit: a document is any number of chunks. This bounds
-/// how long one uninterruptible `rewriter.write()` can run on an async worker.
+/// how much one message carries: how long one uninterruptible
+/// `rewriter.write()` runs, and how large a buffer each in-flight call holds
+/// while it does.
 ///
 /// Generous on purpose, so a caller who wants to hand over a whole document
 /// in one message can. Nothing is gained by it: the benchmark shows upload
 /// throughput plateaus around a 256 KiB chunk, and 16 KiB against 1 MiB is the
 /// difference between roughly 85 and 96 MiB/s. Past that a larger chunk only
-/// buys a longer stretch in which one request occupies a worker and a bigger
-/// transient buffer per in-flight call, so prefer 256 KiB to 1 MiB in a client
-/// unless there is a reason not to.
+/// buys a longer stretch in which one request occupies a blocking thread and
+/// a bigger transient buffer per in-flight call, so prefer 256 KiB to 1 MiB in
+/// a client unless there is a reason not to.
 ///
 /// [`LolHtmlGrpc::into_service`] derives tonic's decoding limit from this, so
 /// the two cannot drift. They did once: this was 8 MiB while tonic's default
@@ -79,12 +79,63 @@ const OUTBOUND_BUFFER: usize = 256;
 pub const DEFAULT_MAX_CHUNK_BYTES: usize = 100 * 1024 * 1024;
 
 /// Default for how long an open `Extract` stream may go without an inbound
-/// frame, in milliseconds.
+/// chunk that carries document bytes, in milliseconds.
 ///
 /// A client that sends its options and then stalls would otherwise pin a
 /// server task forever; this is the bound on that. Sixty seconds is generous
 /// for a protocol whose only reason to pause is a slow upstream of its own.
+/// Frames that carry nothing, empty frames and empty chunks, do not count:
+/// a client could otherwise keep a stream open for ever by sending them. It
+/// also bounds the wait for the options frame, which starts once the call
+/// holds its stream slot (or the upload timeout, if that is shorter).
 pub const DEFAULT_IDLE_TIMEOUT_MS: usize = 60_000;
+
+/// Default for how long an `Extract` stream's upload may take in all, in
+/// milliseconds.
+///
+/// The idle timeout bounds silence, not length, so a client trickling a byte
+/// at a time could hold a stream for as long as it liked. This bounds the
+/// whole upload, counted from the options frame to the half-close, including
+/// any time the parse spends waiting for the client to read. Ten minutes is
+/// several gigabytes at the throughput the benchmark measures.
+pub const DEFAULT_UPLOAD_TIMEOUT_MS: usize = 600_000;
+
+/// Default for how long an open `Extract` stream may go without its client
+/// taking a single response while events wait, in milliseconds.
+///
+/// The counterpart of the idle timeout, for the other direction, and idle
+/// rather than total in the same way: every response the client takes starts
+/// it over, so a slow reader never reaches it and only one that has stopped
+/// reading does. It starts over only once the client has had time to read
+/// what it took at [`outbound::MIN_READ_RATE`], so a response of megabytes
+/// that takes longer than this to read is not mistaken for a client that has
+/// stopped. In practice that is a client that uploads the whole document
+/// before reading anything. Once the output outgrows the outbound buffer and
+/// the transport's windows, such a client and any bounded server wait on each
+/// other forever; this turns the wait into `RESOURCE_EXHAUSTED` and gives the
+/// stream slot back.
+pub const DEFAULT_SEND_TIMEOUT_MS: usize = 60_000;
+
+/// Default byte budget for one stream's events waiting to be sent.
+///
+/// A client that reads while it uploads never comes near it. It is what an
+/// upload-then-read client gets before backpressure, and then the send
+/// timeout, applies: 8 MiB holds the whole output of most pages.
+///
+/// The bound is the larger of this and the largest single event, not this
+/// alone: an event larger than the whole buffer is let through on its own,
+/// charged as if it filled the buffer exactly. One reassembled text node or
+/// one huge attribute value can be as large as the call's memory limit, so a
+/// stream's queue can hold up to that, and 64 streams up to 64 times it.
+pub const DEFAULT_OUTBOUND_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// Default ceiling on the memory limit a call may ask for, in bytes.
+///
+/// A call names its own limit in `MemoryLimits.max_bytes`, and without a
+/// ceiling it could name `u64::MAX` and switch the parser's only memory guard
+/// off. The default equals the per-call default, so callers can lower their
+/// limit but not raise it unless the operator raises this.
+pub const DEFAULT_MEMORY_CEILING_BYTES: usize = rules::DEFAULT_MAX_MEMORY_BYTES as usize;
 
 /// Default cap on simultaneously open `Extract` streams.
 ///
@@ -95,13 +146,14 @@ pub const DEFAULT_IDLE_TIMEOUT_MS: usize = 60_000;
 /// orthogonal to tonic's per-connection `max_concurrent_streams`.
 pub const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 64;
 
-/// Queue the handlers push into, drained after every chunk.
-type EventSink = mpsc::UnboundedSender<pb::extract_response::Event>;
-
 /// The `lolhtml.v1.LolHtmlService` implementation.
 pub struct LolHtmlGrpc {
     max_chunk_bytes: usize,
     idle_timeout: Duration,
+    upload_timeout: Duration,
+    send_timeout: Duration,
+    outbound_buffer_bytes: usize,
+    memory_ceiling: usize,
     stream_permits: Arc<Semaphore>,
 }
 
@@ -118,6 +170,10 @@ impl LolHtmlGrpc {
         Self {
             max_chunk_bytes: DEFAULT_MAX_CHUNK_BYTES,
             idle_timeout: Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS as u64),
+            upload_timeout: Duration::from_millis(DEFAULT_UPLOAD_TIMEOUT_MS as u64),
+            send_timeout: Duration::from_millis(DEFAULT_SEND_TIMEOUT_MS as u64),
+            outbound_buffer_bytes: DEFAULT_OUTBOUND_BUFFER_BYTES,
+            memory_ceiling: DEFAULT_MEMORY_CEILING_BYTES,
             stream_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_STREAMS)),
         }
     }
@@ -134,6 +190,36 @@ impl LolHtmlGrpc {
     #[must_use]
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
+        self
+    }
+
+    /// Override how long an `Extract` stream's whole upload may take before
+    /// the server ends it with `DEADLINE_EXCEEDED`.
+    #[must_use]
+    pub fn with_upload_timeout(mut self, timeout: Duration) -> Self {
+        self.upload_timeout = timeout;
+        self
+    }
+
+    /// Override how long an `Extract` stream may go without its client taking
+    /// a response before the server ends it with `RESOURCE_EXHAUSTED`.
+    #[must_use]
+    pub fn with_send_timeout(mut self, timeout: Duration) -> Self {
+        self.send_timeout = timeout;
+        self
+    }
+
+    /// Override the byte budget for one stream's events waiting to be sent.
+    #[must_use]
+    pub fn with_outbound_buffer_bytes(mut self, bytes: usize) -> Self {
+        self.outbound_buffer_bytes = bytes;
+        self
+    }
+
+    /// Override the ceiling on the memory limit a call may ask for.
+    #[must_use]
+    pub fn with_max_memory_bytes(mut self, bytes: usize) -> Self {
+        self.memory_ceiling = bytes;
         self
     }
 
@@ -171,7 +257,7 @@ impl LolHtmlGrpc {
 
 #[tonic::async_trait]
 impl pb::lol_html_service_server::LolHtmlService for LolHtmlGrpc {
-    type ExtractStream = ReceiverStream<Result<pb::ExtractResponse, Status>>;
+    type ExtractStream = OutboundStream;
 
     async fn extract(
         &self,
@@ -194,7 +280,20 @@ impl pb::lol_html_service_server::LolHtmlService for LolHtmlGrpc {
         // way the request can be rejected is resolved here, as a status on
         // the call. Once the stream opens, only a parse failure can end it
         // badly, and that arrives in-band.
-        let options = match inbound.message().await? {
+        //
+        // The slot is already held, so the wait for it is bounded like any
+        // other silence on the upload: a client that opens calls and sends
+        // nothing would otherwise hold every slot for as long as it liked.
+        let first_frame_timeout = self.idle_timeout.min(self.upload_timeout);
+        let first = tokio::time::timeout(first_frame_timeout, inbound.message())
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "no `options` frame received within {} ms; the stream has been closed",
+                    first_frame_timeout.as_millis()
+                ))
+            })?;
+        let options = match first? {
             Some(pb::ExtractRequest {
                 frame: Some(pb::extract_request::Frame::Options(options)),
             }) => options,
@@ -210,30 +309,72 @@ impl pb::lol_html_service_server::LolHtmlService for LolHtmlGrpc {
             }
         };
 
-        let compiled = rules::compile(&options)?;
-        let (tx, rx) = mpsc::channel(OUTBOUND_BUFFER);
-        let max_chunk_bytes = self.max_chunk_bytes;
-        let idle_timeout = self.idle_timeout;
+        let compiled = rules::compile(&options, self.memory_ceiling)?;
+        let (outbound, stream) = outbound::channel(self.outbound_buffer_bytes);
+        let limits = Limits {
+            max_chunk_bytes: self.max_chunk_bytes,
+            idle_timeout: self.idle_timeout,
+            upload_timeout: self.upload_timeout,
+            send_timeout: self.send_timeout,
+        };
 
         let span = tracing::info_span!("extract", rules = compiled.rules.len());
         tokio::spawn(
             async move {
-                // Moved in so the permit outlives the parse, not just the
-                // call that opened it.
-                let _permit = permit;
-                drive(inbound, compiled, tx, max_chunk_bytes, idle_timeout).await;
+                let ending = drive(&mut inbound, compiled, &outbound, limits).await;
+
+                // Queued events are memory the stream slot accounts for, so
+                // the slot is held until the client has taken them, or has
+                // taken nothing for the send timeout and they are thrown
+                // away. Released any earlier, a client that never reads
+                // could leave a full queue behind for every slot it cycles
+                // through. After an early ending the rest of the upload is
+                // read and dropped meanwhile: a client that reads only once
+                // it has finished uploading would otherwise sit blocked on
+                // its write for the whole send timeout and then get the
+                // timeout's status in place of its result.
+                let delivery = match ending {
+                    Ending::Complete => Some(outbound.delivered(limits.send_timeout).await),
+                    Ending::Early => {
+                        Some(delivered_draining(&mut inbound, &outbound, limits).await)
+                    }
+                    Ending::NotReading | Ending::Gone => None,
+                };
+                if delivery == Some(Delivery::Stalled) {
+                    tracing::warn!(
+                        queued_bytes = outbound.queued_bytes(),
+                        send_timeout_ms = limits.send_timeout.as_millis() as u64,
+                        "client stopped reading; discarding its unread events"
+                    );
+                    outbound.abort(not_reading(limits.send_timeout));
+                }
+                drop(permit);
+
+                // A client that reads only once its upload is finished cannot
+                // see how the call ended until it has finished uploading, and
+                // the server no longer reading its upload is what stops it.
+                // So the rest is read and dropped, holding no slot and no
+                // parser, until the status has gone out, the upload ends or
+                // goes idle, or the client takes nothing for the send timeout.
+                if matches!(ending, Ending::Early | Ending::NotReading) {
+                    discard_upload(&mut inbound, &outbound, limits).await;
+                }
             }
             .instrument(span),
         );
 
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(stream))
     }
 
     async fn validate_selectors(
         &self,
         request: Request<pb::ValidateSelectorsRequest>,
     ) -> Result<Response<pb::ValidateSelectorsResponse>, Status> {
-        let diagnostics = rules::diagnose(&request.into_inner().rules);
+        let rules = request.into_inner().rules;
+        // The same shape limits as Extract, so a set this call passes is
+        // never refused there for its size.
+        rules::check_rule_set(&rules)?;
+        let diagnostics = rules::diagnose(&rules);
         Ok(Response::new(pb::ValidateSelectorsResponse { diagnostics }))
     }
 
@@ -256,16 +397,50 @@ impl pb::lol_html_service_server::LolHtmlService for LolHtmlGrpc {
     }
 }
 
-/// Run one document through the rewriter, forwarding events as they occur.
-async fn drive(
-    mut inbound: Streaming<pb::ExtractRequest>,
-    compiled: CompiledOptions,
-    tx: mpsc::Sender<Result<pb::ExtractResponse, Status>>,
+/// The per-call limits the driver enforces.
+#[derive(Clone, Copy)]
+struct Limits {
     max_chunk_bytes: usize,
     idle_timeout: Duration,
-) {
+    upload_timeout: Duration,
+    send_timeout: Duration,
+}
+
+/// How a call's parse ended, which decides what is left to do for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// A terminal item is queued and the upload was read to its end.
+    Complete,
+    /// A terminal item is queued, but the client may still be uploading.
+    Early,
+    /// The client stopped reading: its unread events were discarded and a
+    /// status queued in their place.
+    NotReading,
+    /// The response stream is gone; nothing more can be delivered.
+    Gone,
+}
+
+/// The status a call ends with when its client stops reading.
+fn not_reading(send_timeout: Duration) -> Status {
+    Status::resource_exhausted(format!(
+        "the client took no responses for {} ms while events were waiting, so the stream \
+         was ended; read the response stream while uploading, not after",
+        send_timeout.as_millis()
+    ))
+}
+
+/// Run one document through the rewriter, forwarding events as they occur.
+///
+/// Returns once a terminal item is queued or the client is gone. What
+/// happens after that, waiting for the client to take its result and
+/// draining an upload that is still arriving, is the caller's.
+async fn drive(
+    inbound: &mut Streaming<pb::ExtractRequest>,
+    compiled: CompiledOptions,
+    outbound: &Outbound,
+    limits: Limits,
+) -> Ending {
     let started_at = Instant::now();
-    let (sink, mut events) = mpsc::unbounded_channel();
     let counters: Vec<Arc<AtomicU64>> = compiled
         .rules
         .iter()
@@ -273,106 +448,169 @@ async fn drive(
         .collect();
 
     let encoding = compiled.encoding_name().to_owned();
+    let sink = Sink {
+        outbound: outbound.clone(),
+        send_timeout: limits.send_timeout,
+        text: Arc::new(TextBudget {
+            held: AtomicUsize::new(0),
+            limit: compiled.max_memory_bytes,
+        }),
+    };
     let settings = build_settings(&compiled, &sink, &counters);
     let mut rewriter = HtmlRewriter::new(settings, |_: &[u8]| {});
 
     // The sink is cloned into every handler; this original would otherwise
-    // keep the channel open for no reason.
+    // count as a producer for no reason.
     drop(sink);
 
     let started = pb::extract_response::Event::Started(pb::ExtractStarted {
         encoding,
         rule_count: u32::try_from(compiled.rules.len()).unwrap_or(u32::MAX),
     });
-    if !send(&tx, started).await {
-        return;
+    if !outbound.push(started) {
+        return Ending::Gone;
     }
 
     let mut bytes_parsed = 0u64;
 
+    // An open stream whose client has gone quiet still holds a task and a
+    // parser, so silence is bounded. The idle deadline moves on only with a
+    // chunk that carries bytes, once it is parsed, so a long document that
+    // keeps sending never trips it and frames that carry nothing do not hold
+    // it off. The upload deadline never moves.
+    let upload_deadline = tokio::time::Instant::now() + limits.upload_timeout;
+    let mut idle_deadline = tokio::time::Instant::now() + limits.idle_timeout;
+
     loop {
-        // An open stream whose client has gone quiet still holds a task and a
-        // parser, so silence is bounded. The timeout is idle, not total: it
-        // resets with every frame, and a document of any length that keeps
-        // sending never trips it.
-        let frame = match tokio::time::timeout(idle_timeout, inbound.message()).await {
-            Ok(Ok(Some(request))) => request.frame,
-            Ok(Ok(None)) => break,
+        let deadline = idle_deadline.min(upload_deadline);
+        let frame = match next_frame(inbound, outbound, deadline).await {
+            Some(Ok(Some(request))) => request.frame,
+            Some(Ok(None)) => break,
             // The client's own stream failed. There is no useful in-band
             // event for that; propagate the status and stop.
-            Ok(Err(status)) => {
-                let _ = tx.send(Err(status)).await;
-                return;
+            Some(Err(status)) => {
+                outbound.fail(status);
+                return Ending::Early;
             }
             // Same shape as the arm above, for the same reason: the error
-            // taxonomy in the contract mirrors lol-html's, and an idle client
-            // is not a parse failure, so this ends the call with a status
-            // rather than an in-band event.
-            Err(_elapsed) => {
+            // taxonomy in the contract mirrors lol-html's, and a slow or
+            // idle client is not a parse failure, so this ends the call with
+            // a status rather than an in-band event.
+            None if tokio::time::Instant::now() >= upload_deadline => {
                 tracing::warn!(
-                    idle_timeout_ms = idle_timeout.as_millis() as u64,
+                    bytes_parsed,
+                    upload_timeout_ms = limits.upload_timeout.as_millis() as u64,
+                    "upload ran past its timeout; ending the stream"
+                );
+                outbound.fail(Status::deadline_exceeded(format!(
+                    "the upload did not finish within {} ms; the stream has been closed",
+                    limits.upload_timeout.as_millis()
+                )));
+                return Ending::Early;
+            }
+            None => {
+                tracing::warn!(
+                    idle_timeout_ms = limits.idle_timeout.as_millis() as u64,
                     "client went idle; ending the stream"
                 );
-                let _ = tx
-                    .send(Err(Status::deadline_exceeded(format!(
-                        "no frame received within {} ms; the stream has been closed",
-                        idle_timeout.as_millis()
-                    ))))
-                    .await;
-                return;
+                outbound.fail(Status::deadline_exceeded(format!(
+                    "no document bytes received within {} ms; the stream has been closed",
+                    limits.idle_timeout.as_millis()
+                )));
+                return Ending::Early;
             }
         };
 
         let chunk = match frame {
             Some(pb::extract_request::Frame::Chunk(chunk)) => chunk,
             Some(pb::extract_request::Frame::Options(_)) => {
-                let _ = tx
-                    .send(Err(Status::invalid_argument(
-                        "`options` may only be sent once, as the first frame",
-                    )))
-                    .await;
-                return;
+                outbound.fail(Status::invalid_argument(
+                    "`options` may only be sent once, as the first frame",
+                ));
+                return Ending::Early;
             }
             // An empty frame carries nothing and means nothing; skip it
             // rather than treat it as end of document.
             None => continue,
         };
-
-        if chunk.len() > max_chunk_bytes {
-            let _ = tx
-                .send(Err(Status::invalid_argument(format!(
-                    "chunk of {} bytes exceeds the {max_chunk_bytes} byte limit; \
-                     split the document into more, smaller chunks",
-                    chunk.len(),
-                ))))
-                .await;
-            return;
+        // Nor does an empty chunk, and neither keeps the stream alive.
+        if chunk.is_empty() {
+            continue;
         }
 
-        if let Err(err) = rewriter.write(&chunk) {
+        if chunk.len() > limits.max_chunk_bytes {
+            outbound.fail(Status::invalid_argument(format!(
+                "chunk of {} bytes exceeds the {} byte limit; \
+                 split the document into more, smaller chunks",
+                chunk.len(),
+                limits.max_chunk_bytes,
+            )));
+            return Ending::Early;
+        }
+
+        // CPU-bound, and blocking whenever the client reads slower than the
+        // parse produces: the handlers wait in here for room in the outbound
+        // queue. Neither belongs on an async worker.
+        let size = chunk.len() as u64;
+        let (returned, written) = match tokio::task::spawn_blocking(move || {
+            let written = rewriter.write(&chunk);
+            (rewriter, written)
+        })
+        .await
+        {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                parse_task_failed(outbound, &err);
+                return Ending::Early;
+            }
+        };
+        rewriter = returned;
+
+        if let Err(err) = written {
+            if let Some(ending) = stopped_by_client(&err, outbound, limits, bytes_parsed) {
+                return ending;
+            }
             // Events produced before the failure are still valid and were
-            // paid for, so they go out ahead of the error. The failed chunk
-            // itself is not counted: it was not parsed.
-            drain(&mut events, &tx).await;
-            finish_with_error(&tx, &err, &compiled, bytes_parsed, &counters, &started_at).await;
-            return;
+            // paid for, so they stay queued ahead of the error. The failed
+            // chunk itself is not counted: it was not parsed.
+            finish_with_error(
+                outbound,
+                &err,
+                &compiled,
+                bytes_parsed,
+                &counters,
+                &started_at,
+            );
+            return Ending::Early;
         }
 
-        bytes_parsed += chunk.len() as u64;
+        bytes_parsed += size;
+        idle_deadline = tokio::time::Instant::now() + limits.idle_timeout;
+    }
 
-        if !drain(&mut events, &tx).await {
-            return;
+    // Whatever `end()` queues goes out with the terminal item, which always
+    // wakes the response stream, so there is nothing to flush here.
+    let ended = match tokio::task::spawn_blocking(move || rewriter.end()).await {
+        Ok(ended) => ended,
+        Err(err) => {
+            parse_task_failed(outbound, &err);
+            return Ending::Complete;
         }
-    }
+    };
 
-    if let Err(err) = rewriter.end() {
-        drain(&mut events, &tx).await;
-        finish_with_error(&tx, &err, &compiled, bytes_parsed, &counters, &started_at).await;
-        return;
-    }
-
-    if !drain(&mut events, &tx).await {
-        return;
+    if let Err(err) = ended {
+        if let Some(ending) = stopped_by_client(&err, outbound, limits, bytes_parsed) {
+            return ending;
+        }
+        finish_with_error(
+            outbound,
+            &err,
+            &compiled,
+            bytes_parsed,
+            &counters,
+            &started_at,
+        );
+        return Ending::Complete;
     }
 
     let matches = total_matches(&counters);
@@ -382,7 +620,7 @@ async fn drive(
         bailed_out: false,
         bail_out_reason: String::new(),
     });
-    send(&tx, finished).await;
+    outbound.push(finished);
     tracing::info!(
         bytes_parsed,
         matches,
@@ -390,6 +628,121 @@ async fn drive(
         duration_ms = started_at.elapsed().as_millis() as u64,
         "stream finished"
     );
+    Ending::Complete
+}
+
+/// The next frame of the upload, first releasing queued events to the client
+/// if that frame is not already here, or `None` once `deadline` has passed.
+///
+/// Events are released when the driver is about to wait, not after every
+/// chunk. Released per chunk, a client that uploads small chunks faster than
+/// they are parsed gets one tiny DATA frame each, and h2 (0.4.18 onward)
+/// treats a pile of unread tiny frames as a flood and closes the connection.
+/// Waiting is the moment nothing more is coming soon, so this costs no
+/// latency: a match still reaches the client before the rest of the upload.
+async fn next_frame(
+    inbound: &mut Streaming<pb::ExtractRequest>,
+    outbound: &Outbound,
+    deadline: tokio::time::Instant,
+) -> Option<Result<Option<pb::ExtractRequest>, Status>> {
+    // Checked before a frame that is already here is taken too, or a client
+    // sending empty frames as fast as they are read would never meet it.
+    if tokio::time::Instant::now() >= deadline {
+        return None;
+    }
+    let mut next = std::pin::pin!(inbound.message());
+    if let Poll::Ready(frame) = std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
+    {
+        return Some(frame);
+    }
+    outbound.flush();
+    tokio::time::timeout_at(deadline, next).await.ok()
+}
+
+/// The ending for a parse one of the server's own handlers stopped because
+/// of the client rather than the document, or `None` when the failure is the
+/// document's and belongs in-band.
+fn stopped_by_client(
+    err: &RewritingError,
+    outbound: &Outbound,
+    limits: Limits,
+    bytes_parsed: u64,
+) -> Option<Ending> {
+    match errors::handler_stop(err)? {
+        HandlerStop::ClientGone => Some(Ending::Gone),
+        HandlerStop::NotReading { queued_bytes } => {
+            tracing::warn!(
+                queued_bytes,
+                bytes_parsed,
+                send_timeout_ms = limits.send_timeout.as_millis() as u64,
+                "client stopped reading; ending the stream"
+            );
+            // Discarded rather than left for a client that may never read:
+            // the queue is the memory the stream slot, about to be released,
+            // was accounting for.
+            outbound.abort(not_reading(limits.send_timeout));
+            Some(Ending::NotReading)
+        }
+        HandlerStop::TextOverLimit { .. } => None,
+    }
+}
+
+/// End a call whose parse task died, which only a bug can cause: a panic in
+/// a debug build, since release builds abort on panic.
+fn parse_task_failed(outbound: &Outbound, err: &tokio::task::JoinError) {
+    tracing::error!(error = %err, "the parse task failed");
+    outbound.fail(Status::internal("the parse failed inside the server"));
+}
+
+/// Read and drop the rest of an upload the server has stopped parsing, so a
+/// client that reads only after uploading gets to its read and sees how the
+/// call ended.
+///
+/// Stops as soon as the terminal item has gone out or the client is gone,
+/// when the upload ends, fails or goes idle, or once the client has taken
+/// nothing for the send timeout, which bounds how long a client that keeps
+/// uploading can keep this going.
+async fn discard_upload(
+    inbound: &mut Streaming<pb::ExtractRequest>,
+    outbound: &Outbound,
+    limits: Limits,
+) {
+    let delivered = outbound.delivered(limits.send_timeout);
+    tokio::pin!(delivered);
+    loop {
+        tokio::select! {
+            _ = &mut delivered => return,
+            frame = tokio::time::timeout(limits.idle_timeout, inbound.message()) => {
+                if !matches!(frame, Ok(Ok(Some(_)))) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Wait for the terminal item to be delivered, reading and dropping the rest
+/// of the upload meanwhile.
+///
+/// Unlike [`discard_upload`], an upload that ends, fails or goes idle only
+/// stops the reading, not the wait: the result is still owed to the client,
+/// and the send timeout still bounds how long it has to take it.
+async fn delivered_draining(
+    inbound: &mut Streaming<pb::ExtractRequest>,
+    outbound: &Outbound,
+    limits: Limits,
+) -> Delivery {
+    let delivered = outbound.delivered(limits.send_timeout);
+    tokio::pin!(delivered);
+    let mut uploading = true;
+    loop {
+        tokio::select! {
+            delivery = &mut delivered => return delivery,
+            frame = tokio::time::timeout(limits.idle_timeout, inbound.message()), if uploading => {
+                uploading = matches!(frame, Ok(Ok(Some(_))));
+            }
+        }
+    }
 }
 
 /// Close a run that ended in a parse failure.
@@ -398,8 +751,8 @@ async fn drive(
 /// caller asked for that; everything else is terminal. An ambiguity bail-out
 /// is never graceful, because continuing past it is exactly what strict mode
 /// exists to refuse.
-async fn finish_with_error(
-    tx: &mpsc::Sender<Result<pb::ExtractResponse, Status>>,
+fn finish_with_error(
+    outbound: &Outbound,
     err: &RewritingError,
     compiled: &CompiledOptions,
     bytes_parsed: u64,
@@ -417,7 +770,7 @@ async fn finish_with_error(
         pb::extract_response::Event::Error(errors::stream_error(err))
     };
     let bailed_out = matches!(&event, pb::extract_response::Event::Finished(_));
-    send(tx, event).await;
+    outbound.push(event);
     tracing::info!(
         bytes_parsed,
         matches = total_matches(counters),
@@ -446,39 +799,63 @@ fn tally(compiled: &CompiledOptions, counters: &[Arc<AtomicU64>]) -> HashMap<Str
     totals
 }
 
-/// Forward one event, reporting whether the client is still there.
-async fn send(
-    tx: &mpsc::Sender<Result<pb::ExtractResponse, Status>>,
-    event: pb::extract_response::Event,
-) -> bool {
-    tx.send(Ok(pb::ExtractResponse { event: Some(event) }))
-        .await
-        .is_ok()
+/// Where the handlers put events: the call's outbound queue, waiting up to
+/// the send timeout for room, plus the count of text held for reassembly.
+#[derive(Clone)]
+struct Sink {
+    outbound: Outbound,
+    send_timeout: Duration,
+    text: Arc<TextBudget>,
 }
 
-/// Empty the handler queue onto the response stream.
-///
-/// This is where backpressure lives: each send awaits, so a client that reads
-/// slowly stops the driver here, and the driver therefore stops reading
-/// inbound chunks. Returns false once the client has gone away.
-async fn drain(
-    events: &mut mpsc::UnboundedReceiver<pb::extract_response::Event>,
-    tx: &mpsc::Sender<Result<pb::ExtractResponse, Status>>,
-) -> bool {
-    // `try_recv` returns Disconnected once the rewriter, and with it every
-    // handler, has been dropped. Either error means nothing more is coming.
-    while let Ok(event) = events.try_recv() {
-        if !send(tx, event).await {
-            return false;
-        }
+impl Sink {
+    /// Queue one event, or stop the parse if it can no longer be delivered.
+    ///
+    /// Runs on the blocking pool, inside `write()`: waiting here for room is
+    /// what holds the parse still for a slow client.
+    fn emit(&self, event: pb::extract_response::Event) -> lol_html::HandlerResult {
+        let response = pb::ExtractResponse { event: Some(event) };
+        self.outbound
+            .send_blocking(response, self.send_timeout)
+            .map_err(|err| {
+                match err {
+                    SendError::Closed => HandlerStop::ClientGone,
+                    SendError::Stalled { queued_bytes } => HandlerStop::NotReading { queued_bytes },
+                }
+                .into()
+            })
     }
-    true
+}
+
+/// Text held for reassembly across one call's handlers, counted against the
+/// call's memory limit.
+///
+/// lol-html's own limit cannot see this text. lol-html streams text out in
+/// pieces precisely so that it never holds a whole node; the server holds it
+/// instead, and without a count of its own one long text node, or one copy
+/// per text rule, would grow without bound.
+struct TextBudget {
+    held: AtomicUsize,
+    limit: usize,
+}
+
+impl TextBudget {
+    /// Count `bytes` more text as held, reporting whether that stays within
+    /// the limit. Over it the parse ends, so the count is not rolled back.
+    fn hold(&self, bytes: usize) -> bool {
+        self.held.fetch_add(bytes, Ordering::Relaxed) + bytes <= self.limit
+    }
+
+    /// Stop counting `bytes` of text that has left the handler.
+    fn release(&self, bytes: usize) {
+        self.held.fetch_sub(bytes, Ordering::Relaxed);
+    }
 }
 
 /// Assemble the rewriter settings from a validated request.
 fn build_settings(
     compiled: &CompiledOptions,
-    sink: &EventSink,
+    sink: &Sink,
     counters: &[Arc<AtomicU64>],
 ) -> Settings<'static, 'static> {
     let mut settings = Settings::new_send()
@@ -506,7 +883,7 @@ fn build_settings(
 /// Build the per-selector handlers for one rule.
 fn element_handlers(
     rule: &CompiledRule,
-    sink: &EventSink,
+    sink: &Sink,
     counter: Arc<AtomicU64>,
     compiled: &CompiledOptions,
 ) -> ElementContentHandlers<'static> {
@@ -545,7 +922,7 @@ fn element_handlers(
                 },
                 span: want_spans.then(|| convert::source_span(&el.source_location())),
             };
-            let _ = sink.send(pb::extract_response::Event::Element(event));
+            sink.emit(pb::extract_response::Event::Element(event))?;
 
             if want_end {
                 let (id, sink) = (id.clone(), sink.clone());
@@ -554,13 +931,12 @@ fn element_handlers(
                 // closes all produce nothing here, which is why the contract
                 // says this is not a dependable "element finished" signal.
                 let registered = el.on_end_tag(Box::new(move |end: &mut EndTag<'_>| {
-                    let _ = sink.send(pb::extract_response::Event::EndTag(pb::EndTagFound {
+                    sink.emit(pb::extract_response::Event::EndTag(pb::EndTagFound {
                         rule_id: id,
                         name: end.name(),
                         name_raw: end.name_preserve_case(),
                         span: want_spans.then(|| convert::source_span(&end.source_location())),
-                    }));
-                    Ok(())
+                    }))
                 }));
                 // `on_end_tag` refuses on an element that cannot have one.
                 // That is information, not a failure: there is simply no end
@@ -584,12 +960,11 @@ fn element_handlers(
     if rule.comments {
         let (id, sink, want_spans) = (rule.id.clone(), sink.clone(), rule.spans);
         handlers = handlers.comments(move |comment: &mut Comment<'_>| {
-            let _ = sink.send(pb::extract_response::Event::Comment(pb::CommentFound {
+            sink.emit(pb::extract_response::Event::Comment(pb::CommentFound {
                 rule_id: id.clone(),
                 text: comment.text(),
                 span: want_spans.then(|| convert::source_span(&comment.source_location())),
-            }));
-            Ok(())
+            }))
         });
     }
 
@@ -599,7 +974,7 @@ fn element_handlers(
 /// Build the document-scope handlers.
 fn document_handlers(
     scope: &rules::DocumentScope,
-    sink: &EventSink,
+    sink: &Sink,
     compiled: &CompiledOptions,
 ) -> DocumentContentHandlers<'static> {
     let mut handlers = DocumentContentHandlers::default();
@@ -607,26 +982,24 @@ fn document_handlers(
     if scope.doctype {
         let (id, sink, want_spans) = (scope.id.clone(), sink.clone(), scope.spans);
         handlers = handlers.doctype(move |doctype: &mut Doctype<'_>| {
-            let _ = sink.send(pb::extract_response::Event::Doctype(pb::DoctypeFound {
+            sink.emit(pb::extract_response::Event::Doctype(pb::DoctypeFound {
                 rule_id: id.clone(),
                 name: doctype.name(),
                 public_id: doctype.public_id(),
                 system_id: doctype.system_id(),
                 span: want_spans.then(|| convert::source_span(&doctype.source_location())),
-            }));
-            Ok(())
+            }))
         });
     }
 
     if scope.comments {
         let (id, sink, want_spans) = (scope.id.clone(), sink.clone(), scope.spans);
         handlers = handlers.comments(move |comment: &mut Comment<'_>| {
-            let _ = sink.send(pb::extract_response::Event::Comment(pb::CommentFound {
+            sink.emit(pb::extract_response::Event::Comment(pb::CommentFound {
                 rule_id: id.clone(),
                 text: comment.text(),
                 span: want_spans.then(|| convert::source_span(&comment.source_location())),
-            }));
-            Ok(())
+            }))
         });
     }
 
@@ -650,9 +1023,14 @@ fn document_handlers(
 /// those to a caller unreassembled is the single most reliable way to make a
 /// client look correct in testing and cut words in half in production, which
 /// is why reassembly is the default and the raw view is opt-in.
+///
+/// The text held while a node is reassembled counts against the call's
+/// memory limit, summed across rules. A node that outgrows it ends the run
+/// the way any other memory-limit overrun does, rather than being split into
+/// pieces a caller relying on whole nodes would not expect.
 fn text_handler(
     rule_id: String,
-    sink: EventSink,
+    sink: Sink,
     want_spans: bool,
     compiled: &CompiledOptions,
 ) -> impl FnMut(&mut TextChunk<'_>) -> lol_html::HandlerResult + Send + 'static {
@@ -670,6 +1048,7 @@ fn text_handler(
             // Reset even for text we are dropping: a filtered node must not
             // bleed into whatever is accumulated next.
             if last {
+                sink.text.release(buffer.len());
                 buffer.clear();
                 span = None;
             }
@@ -681,14 +1060,13 @@ fn text_handler(
             // terminator, so `last_in_node` always reaches the client and
             // concatenating a node's fragments reproduces the reassembled
             // text exactly.
-            let _ = sink.send(pb::extract_response::Event::Text(pb::TextNode {
+            return sink.emit(pb::extract_response::Event::Text(pb::TextNode {
                 rule_id: rule_id.clone(),
                 text: chunk.as_str().to_owned(),
                 text_type: text_type as i32,
                 span: want_spans.then(|| convert::source_span(&chunk.source_location())),
                 last_in_node: last,
             }));
-            return Ok(());
         }
 
         if want_spans {
@@ -698,32 +1076,47 @@ fn text_handler(
                 None => (bytes.start, bytes.end),
             });
         }
-        buffer.push_str(chunk.as_str());
+
+        let piece = chunk.as_str();
+        if !piece.is_empty() {
+            // Counted before it is copied, so the copy that would cross the
+            // limit is never made.
+            if !sink.text.hold(piece.len()) {
+                return Err(HandlerStop::TextOverLimit {
+                    limit_bytes: sink.text.limit,
+                }
+                .into());
+            }
+            buffer.push_str(piece);
+        }
 
         if last {
+            sink.text.release(buffer.len());
             // A text node with no text is not an event, and lol-html emits an
             // empty terminating chunk for every node, so this is the common
             // case rather than an edge one.
             if !buffer.is_empty() {
+                // Taken rather than copied or cleared, so a long node leaves
+                // no allocation of its size behind in this handler.
+                let written = std::mem::take(&mut buffer);
                 // lol-html hands text back exactly as written, so the entity
                 // decode the proto promises for DATA and RCDATA happens
                 // here, after reassembly — an entity split across fragments
                 // is whole again by this point. Raw mode never reaches this
                 // branch: fragments go out verbatim, as documented.
-                let text = if chunk.text_type().allows_html_entities() && buffer.contains('&') {
-                    htmlize::unescape(buffer.as_str()).into_owned()
+                let text = if chunk.text_type().allows_html_entities() && written.contains('&') {
+                    htmlize::unescape(written.as_str()).into_owned()
                 } else {
-                    std::mem::take(&mut buffer)
+                    written
                 };
-                let _ = sink.send(pb::extract_response::Event::Text(pb::TextNode {
+                sink.emit(pb::extract_response::Event::Text(pb::TextNode {
                     rule_id: rule_id.clone(),
                     text,
                     text_type: text_type as i32,
                     span: span.map(|(start, end)| pb::SourceSpan { start, end }),
                     last_in_node: true,
-                }));
+                }))?;
             }
-            buffer.clear();
             span = None;
         }
 

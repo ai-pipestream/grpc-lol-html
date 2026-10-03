@@ -3,5 +3,6 @@
 typ = "typ"
 
 [files]
-# Generated code is not hand-written prose.
-extend-exclude = ["src/gen/**"]
+# Generated code is not hand-written prose. The entity fixture splits words
+# around HTML entities on purpose (`caf&eacute;`), which is what it tests.
+extend-exclude = ["src/gen/**", "demos/sample-data/entities.html"]

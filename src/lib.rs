@@ -6,16 +6,19 @@
 //! Design rules:
 //! - **Nothing is retained.** `lol_html` is a forward-only transducer: bytes
 //!   in, events out, no document to go back to. There is no handle store and
-//!   no server-side copy of the input, so memory stays flat whatever the
-//!   document size. This is the opposite of the sibling `grpc-calamine`
-//!   service, and it is the library's nature rather than a simplification.
+//!   no server-side copy of the input, so memory does not grow with the
+//!   document. What a call can hold instead is bounded by limits: its memory
+//!   limit, under a server ceiling, for parser state and reassembled text; the
+//!   [`outbound`] buffer for unsent events; the chunk cap for input. This is
+//!   the opposite of the sibling `grpc-calamine` service, and it is the
+//!   library's nature rather than a simplification.
 //! - **Backpressure survives the sync/async boundary.** `lol_html` handlers
-//!   are synchronous closures that cannot await, so they queue into an
-//!   unbounded [`tokio::sync::mpsc`] whose `send` never blocks, and
-//!   [`service`] drains that queue after every chunk, awaiting each forward
-//!   onto the bounded outbound channel where backpressure actually lives. A
-//!   slow client therefore slows the parser instead of growing a buffer. See
-//!   the [`service`] module documentation.
+//!   are synchronous closures that cannot await, so the parse runs on tokio's
+//!   blocking pool and the handlers put events straight onto a queue bounded
+//!   in bytes, waiting there when it is full. A slow client therefore slows
+//!   the parser instead of growing a buffer, and one that stops reading
+//!   altogether is cut off after the send timeout. See the [`service`] and
+//!   [`outbound`] module documentation.
 //! - **One-to-one contract.** The protobuf model in `proto/lolhtml/v1`
 //!   mirrors lol-html's public types, including the parts that are easy to
 //!   overlook: every `TextType`, every `Namespace`, per-attribute source
@@ -23,6 +26,7 @@
 
 pub mod convert;
 pub mod errors;
+pub mod outbound;
 pub mod proto;
 pub mod rules;
 pub mod service;

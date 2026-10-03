@@ -33,14 +33,27 @@ jobs:
           registry: docker.io
           username: ${{ secrets.DOCKER_USER }}
           password: ${{ secrets.DOCKER_TOKEN }}
+      # The version reaches the script through the environment, never through
+      # `${{ }}` interpolation into it: an interpolated input is pasted into
+      # the script before the shell parses it, so a crafted value runs as
+      # code in a job holding the Docker Hub token. It is then held to a
+      # semantic version that is also a valid image tag (no `+` build
+      # metadata) before it goes anywhere near a tag list.
       - name: Compute tags
         id: tags
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           svc="docker.io/pipestreamai/grpc-lol-html:latest"
           ui="docker.io/pipestreamai/grpc-lol-html-ui:latest"
-          if [ -n "${{ inputs.version }}" ]; then
-            svc="$svc,docker.io/pipestreamai/grpc-lol-html:${{ inputs.version }}"
-            ui="$ui,docker.io/pipestreamai/grpc-lol-html-ui:${{ inputs.version }}"
+          if [ -n "$VERSION" ]; then
+            if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]{0,63})?$ ]]; then
+              echo "::error::inputs.version must be a semantic version such as 0.1.0 or 1.2.3-rc.1"
+              exit 1
+            fi
+            svc="$svc,docker.io/pipestreamai/grpc-lol-html:$VERSION"
+            ui="$ui,docker.io/pipestreamai/grpc-lol-html-ui:$VERSION"
           fi
           echo "svc=$svc" >> "$GITHUB_OUTPUT"
           echo "ui=$ui" >> "$GITHUB_OUTPUT"

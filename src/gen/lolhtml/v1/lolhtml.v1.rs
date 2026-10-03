@@ -71,9 +71,14 @@ pub struct Attribute {
 /// HTML needs this set.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MemoryLimits {
-    /// Hard cap in bytes on the parser's buffered state. Zero means the server's
-    /// own default rather than "unlimited"; a server accepting arbitrary input
-    /// should never run unlimited.
+    /// Hard cap in bytes on the parser's buffered state, and separately on the
+    /// text the server holds while reassembling text nodes, summed across rules
+    /// (see `raw_text_chunks`). Zero means the server's own default rather than
+    /// "unlimited"; a server accepting arbitrary input should never run
+    /// unlimited.
+    ///
+    /// The server also has a ceiling of its own, and a larger value is cut to
+    /// it, as is the default when the ceiling is lower.
     #[prost(uint64, tag="1")]
     pub max_bytes: u64,
     /// What to do when `max_bytes` is reached.
@@ -90,6 +95,9 @@ pub struct MemoryLimits {
     /// Mirrors `MemorySettings::preallocated_parsing_buffer_size`. Zero means
     /// lol-html's default of 1 KiB. Raising it trades memory for fewer regrowths
     /// on documents known to buffer heavily; it is a tuning knob, not a limit.
+    ///
+    /// lol-html charges the preallocation against `max_bytes`, so it is never
+    /// more than that: a larger value, the 1 KiB default included, is cut to it.
     #[prost(uint64, tag="3")]
     pub preallocated_buffer_bytes: u64,
 }
@@ -100,6 +108,9 @@ pub struct ExtractRule {
     /// produces. Need not be unique, though overlapping ids make the output
     /// ambiguous. Rules are independent: an element matching three rules
     /// produces three events.
+    ///
+    /// At most 256 bytes; a longer id is INVALID_ARGUMENT. It is repeated on
+    /// every match, so a long one is paid for per event.
     #[prost(string, tag="1")]
     pub id: ::prost::alloc::string::String,
     /// A CSS selector, compiled by lol-html's selector VM.
@@ -124,6 +135,8 @@ pub struct ExtractRule {
     /// `:first-child` against `:last-child` is the whole idea: an element is
     /// known to be first the moment it is seen, and cannot be known to be last
     /// until its parent closes. None of these rejections are pending work.
+    ///
+    /// At most 4096 bytes; a longer selector is INVALID_ARGUMENT.
     ///
     /// Use `ValidateSelectors` to check before spending an upload.
     #[prost(string, tag="2")]
@@ -445,16 +458,19 @@ pub enum ParseErrorCode {
     /// Zero value. Never sent by the server.
     Unspecified = 0,
     /// The parser needed more buffered state than `MemoryLimits.max_bytes`
-    /// allowed. Seen as an error only when `graceful_bail_out` was false;
-    /// otherwise the run ends with a `finished` event carrying `bailed_out`.
+    /// allowed, or a text node outgrew it while the server reassembled it. Seen
+    /// as an error only when `graceful_bail_out` was false; otherwise the run
+    /// ends with a `finished` event carrying `bailed_out`.
     MemoryLimitExceeded = 1,
     /// The document reached a state where a streaming parser cannot determine
     /// the correct parsing context, and lol-html refused to guess. See
     /// `ExtractOptions.strict`.
     ParsingAmbiguity = 2,
-    /// A content handler failed. The server's handlers only fail when the
-    /// response stream has already gone away, so a client should not normally
-    /// observe this.
+    /// A content handler failed for a reason the server does not report more
+    /// specifically. Its handlers otherwise stop only when the response stream
+    /// has gone away or the client has stopped reading, both of which end the
+    /// call with a status instead, so a client should not normally observe
+    /// this.
     ContentHandlerError = 3,
 }
 impl ParseErrorCode {
@@ -512,6 +528,10 @@ pub mod extract_request {
 pub struct ExtractOptions {
     /// Selector-scoped rules. May be empty if `document_rule` is set, which is
     /// how you ask only for the doctype.
+    ///
+    /// At most 256 rules; a larger set is INVALID_ARGUMENT. Every rule is
+    /// matched against every element and every match is its own event, so the
+    /// rule count multiplies both the work and the output.
     #[prost(message, repeated, tag="1")]
     pub rules: ::prost::alloc::vec::Vec<ExtractRule>,
     /// Content outside every element, which no selector can reach. Optional.
@@ -570,6 +590,12 @@ pub struct ExtractOptions {
     /// `last_in_node` marking the end of each node. That keeps server memory
     /// constant even for a single enormous text node, at the cost of doing the
     /// reassembly yourself.
+    ///
+    /// Reassembly is where a node is held whole, so the text held for it counts
+    /// against `MemoryLimits.max_bytes`, summed across rules. A node that
+    /// outgrows the limit ends the run with MEMORY_LIMIT_EXCEEDED, or with
+    /// `bailed_out` under `graceful_bail_out`; set this instead if you expect
+    /// text nodes that large.
     ///
     /// Raw fragments are verbatim: no entity decoding, because an entity can be
     /// split across two fragments and a fragment-at-a-time decode would corrupt
