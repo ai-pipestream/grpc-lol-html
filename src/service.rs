@@ -26,9 +26,10 @@
 //! seconds in which an async worker cannot answer health checks, send
 //! keepalives or move other streams.
 //!
-//! Three limits keep one caller from pinning the process: an open stream that
-//! stops sending frames is ended with `DEADLINE_EXCEEDED` after the idle
-//! timeout; one whose client stops reading responses is ended with
+//! Four limits keep one caller from pinning the process: an open stream that
+//! stops sending document bytes is ended with `DEADLINE_EXCEEDED` after the
+//! idle timeout, and one whose upload is still going after the upload
+//! timeout likewise; one whose client stops reading responses is ended with
 //! `RESOURCE_EXHAUSTED` after the send timeout; and the number of live
 //! streams is bounded by a semaphore, past which calls fail fast with
 //! `RESOURCE_EXHAUSTED`. Every finished stream logs its bytes, matches and
@@ -78,12 +79,24 @@ use crate::{convert, errors, rules};
 pub const DEFAULT_MAX_CHUNK_BYTES: usize = 100 * 1024 * 1024;
 
 /// Default for how long an open `Extract` stream may go without an inbound
-/// frame, in milliseconds.
+/// chunk that carries document bytes, in milliseconds.
 ///
 /// A client that sends its options and then stalls would otherwise pin a
 /// server task forever; this is the bound on that. Sixty seconds is generous
 /// for a protocol whose only reason to pause is a slow upstream of its own.
+/// Frames that carry nothing, empty frames and empty chunks, do not count:
+/// a client could otherwise keep a stream open for ever by sending them.
 pub const DEFAULT_IDLE_TIMEOUT_MS: usize = 60_000;
+
+/// Default for how long an `Extract` stream's upload may take in all, in
+/// milliseconds.
+///
+/// The idle timeout bounds silence, not length, so a client trickling a byte
+/// at a time could hold a stream for as long as it liked. This bounds the
+/// whole upload, counted from the options frame to the half-close, including
+/// any time the parse spends waiting for the client to read. Ten minutes is
+/// several gigabytes at the throughput the benchmark measures.
+pub const DEFAULT_UPLOAD_TIMEOUT_MS: usize = 600_000;
 
 /// Default for how long an open `Extract` stream may go without its client
 /// taking a single response while events wait, in milliseconds.
@@ -130,6 +143,7 @@ pub const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 64;
 pub struct LolHtmlGrpc {
     max_chunk_bytes: usize,
     idle_timeout: Duration,
+    upload_timeout: Duration,
     send_timeout: Duration,
     outbound_buffer_bytes: usize,
     memory_ceiling: usize,
@@ -149,6 +163,7 @@ impl LolHtmlGrpc {
         Self {
             max_chunk_bytes: DEFAULT_MAX_CHUNK_BYTES,
             idle_timeout: Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS as u64),
+            upload_timeout: Duration::from_millis(DEFAULT_UPLOAD_TIMEOUT_MS as u64),
             send_timeout: Duration::from_millis(DEFAULT_SEND_TIMEOUT_MS as u64),
             outbound_buffer_bytes: DEFAULT_OUTBOUND_BUFFER_BYTES,
             memory_ceiling: DEFAULT_MEMORY_CEILING_BYTES,
@@ -168,6 +183,14 @@ impl LolHtmlGrpc {
     #[must_use]
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
+        self
+    }
+
+    /// Override how long an `Extract` stream's whole upload may take before
+    /// the server ends it with `DEADLINE_EXCEEDED`.
+    #[must_use]
+    pub fn with_upload_timeout(mut self, timeout: Duration) -> Self {
+        self.upload_timeout = timeout;
         self
     }
 
@@ -271,6 +294,7 @@ impl pb::lol_html_service_server::LolHtmlService for LolHtmlGrpc {
         let limits = Limits {
             max_chunk_bytes: self.max_chunk_bytes,
             idle_timeout: self.idle_timeout,
+            upload_timeout: self.upload_timeout,
             send_timeout: self.send_timeout,
         };
 
@@ -349,6 +373,7 @@ impl pb::lol_html_service_server::LolHtmlService for LolHtmlGrpc {
 struct Limits {
     max_chunk_bytes: usize,
     idle_timeout: Duration,
+    upload_timeout: Duration,
     send_timeout: Duration,
 }
 
@@ -419,31 +444,48 @@ async fn drive(
 
     let mut bytes_parsed = 0u64;
 
+    // An open stream whose client has gone quiet still holds a task and a
+    // parser, so silence is bounded. The idle deadline moves on only with a
+    // chunk that carries bytes, once it is parsed, so a long document that
+    // keeps sending never trips it and frames that carry nothing do not hold
+    // it off. The upload deadline never moves.
+    let upload_deadline = tokio::time::Instant::now() + limits.upload_timeout;
+    let mut idle_deadline = tokio::time::Instant::now() + limits.idle_timeout;
+
     loop {
-        // An open stream whose client has gone quiet still holds a task and a
-        // parser, so silence is bounded. The timeout is idle, not total: it
-        // resets with every frame, and a document of any length that keeps
-        // sending never trips it.
-        let frame = match next_frame(inbound, outbound, limits.idle_timeout).await {
-            Ok(Ok(Some(request))) => request.frame,
-            Ok(Ok(None)) => break,
+        let deadline = idle_deadline.min(upload_deadline);
+        let frame = match next_frame(inbound, outbound, deadline).await {
+            Some(Ok(Some(request))) => request.frame,
+            Some(Ok(None)) => break,
             // The client's own stream failed. There is no useful in-band
             // event for that; propagate the status and stop.
-            Ok(Err(status)) => {
+            Some(Err(status)) => {
                 outbound.fail(status);
                 return Ending::Early;
             }
             // Same shape as the arm above, for the same reason: the error
-            // taxonomy in the contract mirrors lol-html's, and an idle client
-            // is not a parse failure, so this ends the call with a status
-            // rather than an in-band event.
-            Err(_elapsed) => {
+            // taxonomy in the contract mirrors lol-html's, and a slow or
+            // idle client is not a parse failure, so this ends the call with
+            // a status rather than an in-band event.
+            None if tokio::time::Instant::now() >= upload_deadline => {
+                tracing::warn!(
+                    bytes_parsed,
+                    upload_timeout_ms = limits.upload_timeout.as_millis() as u64,
+                    "upload ran past its timeout; ending the stream"
+                );
+                outbound.fail(Status::deadline_exceeded(format!(
+                    "the upload did not finish within {} ms; the stream has been closed",
+                    limits.upload_timeout.as_millis()
+                )));
+                return Ending::Early;
+            }
+            None => {
                 tracing::warn!(
                     idle_timeout_ms = limits.idle_timeout.as_millis() as u64,
                     "client went idle; ending the stream"
                 );
                 outbound.fail(Status::deadline_exceeded(format!(
-                    "no frame received within {} ms; the stream has been closed",
+                    "no document bytes received within {} ms; the stream has been closed",
                     limits.idle_timeout.as_millis()
                 )));
                 return Ending::Early;
@@ -462,6 +504,10 @@ async fn drive(
             // rather than treat it as end of document.
             None => continue,
         };
+        // Nor does an empty chunk, and neither keeps the stream alive.
+        if chunk.is_empty() {
+            continue;
+        }
 
         if chunk.len() > limits.max_chunk_bytes {
             outbound.fail(Status::invalid_argument(format!(
@@ -510,6 +556,7 @@ async fn drive(
         }
 
         bytes_parsed += size;
+        idle_deadline = tokio::time::Instant::now() + limits.idle_timeout;
     }
 
     // Whatever `end()` queues goes out with the terminal item, which always
@@ -556,7 +603,7 @@ async fn drive(
 }
 
 /// The next frame of the upload, first releasing queued events to the client
-/// if that frame is not already here.
+/// if that frame is not already here, or `None` once `deadline` has passed.
 ///
 /// Events are released when the driver is about to wait, not after every
 /// chunk. Released per chunk, a client that uploads small chunks faster than
@@ -567,15 +614,20 @@ async fn drive(
 async fn next_frame(
     inbound: &mut Streaming<pb::ExtractRequest>,
     outbound: &Outbound,
-    idle_timeout: Duration,
-) -> Result<Result<Option<pb::ExtractRequest>, Status>, tokio::time::error::Elapsed> {
+    deadline: tokio::time::Instant,
+) -> Option<Result<Option<pb::ExtractRequest>, Status>> {
+    // Checked before a frame that is already here is taken too, or a client
+    // sending empty frames as fast as they are read would never meet it.
+    if tokio::time::Instant::now() >= deadline {
+        return None;
+    }
     let mut next = std::pin::pin!(inbound.message());
     if let Poll::Ready(frame) = std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
     {
-        return Ok(frame);
+        return Some(frame);
     }
     outbound.flush();
-    tokio::time::timeout(idle_timeout, next).await
+    tokio::time::timeout_at(deadline, next).await.ok()
 }
 
 /// The ending for a parse one of the server's own handlers stopped because

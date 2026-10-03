@@ -41,6 +41,7 @@ fn an_unusable_setting_stops_the_server_at_startup() {
     for (name, value) in [
         ("GRPC_LOL_HTML_SEND_TIMEOUT_MS", "0"),
         ("GRPC_LOL_HTML_IDLE_TIMEOUT_MS", "60s"),
+        ("GRPC_LOL_HTML_UPLOAD_TIMEOUT_MS", "0"),
         ("GRPC_LOL_HTML_MAX_MEMORY_BYTES", "0"),
         ("GRPC_LOL_HTML_OUTBOUND_BUFFER_BYTES", "-1"),
         ("GRPC_LOL_HTML_MAX_CONCURRENT_STREAMS", "0"),

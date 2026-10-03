@@ -1531,6 +1531,108 @@ async fn a_stalled_upload_is_ended_with_deadline_exceeded() {
     );
 }
 
+/// Open a call to `client` and keep sending `frame` every 50 ms after the
+/// options, returning how the call ended and how long that took, or `None`
+/// if it was still open after three seconds.
+async fn keep_sending(
+    client: &mut LolHtmlServiceClient<Channel>,
+    frame: pb::ExtractRequest,
+) -> Option<(tonic::Status, std::time::Duration)> {
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    tx.send(options_frame(pb::ExtractOptions {
+        rules: vec![rule("p", "p")],
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    tx.send(chunk_frame(b"<p>hi</p>")).await.unwrap();
+    let started = std::time::Instant::now();
+    let mut stream = client
+        .extract(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .expect("open the call")
+        .into_inner();
+
+    let sender = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if tx.send(frame.clone()).await.is_err() {
+                break;
+            }
+        }
+    });
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match stream.message().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the call ended OK, though the upload never finished"),
+                Err(status) => break status,
+            }
+        }
+    })
+    .await;
+    sender.abort();
+    ended.ok().map(|status| (status, started.elapsed()))
+}
+
+/// Frames that carry nothing do not keep a stream alive.
+///
+/// The idle timeout used to start over with every frame, so a client that
+/// sent an empty frame or an empty chunk now and then held its stream, and
+/// its parser, for as long as it liked without sending a byte of document.
+#[tokio::test]
+async fn frames_that_carry_nothing_do_not_hold_off_the_idle_timeout() {
+    let mut client = start_configured_server(
+        LolHtmlGrpc::new()
+            .with_idle_timeout(std::time::Duration::from_millis(300))
+            .into_service(),
+    )
+    .await;
+
+    for (what, frame) in [
+        ("empty frames", pb::ExtractRequest { frame: None }),
+        ("empty chunks", chunk_frame(b"")),
+    ] {
+        let (status, took) = keep_sending(&mut client, frame)
+            .await
+            .unwrap_or_else(|| panic!("{what} kept the stream open past the idle timeout"));
+        assert_eq!(status.code(), Code::DeadlineExceeded, "{what}: {status:?}");
+        assert!(
+            took >= std::time::Duration::from_millis(300),
+            "{what}: ended after {took:?}"
+        );
+    }
+}
+
+/// A client that keeps sending document bytes still has to finish its
+/// upload within the upload timeout.
+///
+/// The idle timeout bounds silence and nothing else, so a client trickling
+/// a few bytes at a time could hold a stream for ever without it.
+#[tokio::test]
+async fn an_upload_that_never_finishes_is_ended_by_the_upload_timeout() {
+    let mut client = start_configured_server(
+        LolHtmlGrpc::new()
+            .with_upload_timeout(std::time::Duration::from_millis(500))
+            .into_service(),
+    )
+    .await;
+
+    let (status, took) = keep_sending(&mut client, chunk_frame(b"<p>more</p>"))
+        .await
+        .expect("a trickling upload should be ended by the upload timeout");
+    assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+    assert!(
+        status.message().contains("upload"),
+        "the status should say it was the upload's length: {}",
+        status.message()
+    );
+    assert!(
+        took >= std::time::Duration::from_millis(500),
+        "ended after {took:?}"
+    );
+}
+
 /// Past the concurrent-stream cap, a call is refused before a byte is read.
 #[tokio::test]
 async fn streams_past_the_concurrency_cap_fail_fast() {

@@ -103,19 +103,25 @@ naming the variable, rather than falling back to the default:
 | `GRPC_LOL_HTML_MAX_CHUNK_BYTES` | 100 MiB | largest inbound chunk accepted |
 | `GRPC_LOL_HTML_WINDOW_BYTES` | 4 MiB | HTTP/2 initial stream and connection window |
 | `GRPC_LOL_HTML_IDLE_TIMEOUT_MS` | 60000 | end an `Extract` stream whose client stops sending |
+| `GRPC_LOL_HTML_UPLOAD_TIMEOUT_MS` | 600000 | end an `Extract` stream whose upload takes longer than this in all |
 | `GRPC_LOL_HTML_SEND_TIMEOUT_MS` | 60000 | end an `Extract` stream whose client stops reading |
 | `GRPC_LOL_HTML_OUTBOUND_BUFFER_BYTES` | 8 MiB | unsent events one stream may hold before the parse waits for its client |
 | `GRPC_LOL_HTML_MAX_MEMORY_BYTES` | 64 MiB | ceiling on the memory limit a call may ask for |
 | `GRPC_LOL_HTML_MAX_CONCURRENT_STREAMS` | 64 | cap on open `Extract` streams; past it, calls fail with `RESOURCE_EXHAUSTED` |
 
-The idle timeout is idle, not total: it resets with every frame, so a document
-of any length that keeps sending never trips it. A stalled upload gets
-`DEADLINE_EXCEEDED`, not an in-band `error` event — the contract's error
-taxonomy mirrors lol-html's, and a silent client is not a parse failure. The
-stream cap is per-process and per-parser, orthogonal to tonic's per-connection
-`max_concurrent_streams` (1024): each open stream is a parser instance with
-its own buffers, so an unbounded count would be an unbounded memory
-commitment.
+The idle timeout is idle, not total: it resets with every chunk that carries
+document bytes, so a long document that keeps sending never trips it. Empty
+frames and empty chunks do not reset it, or a client could hold a stream open
+for ever by sending nothing. The upload timeout is the total: the whole upload,
+from the options frame to the half-close and including any time the parse
+spends waiting on a slow reader, must finish within it, so a client trickling
+a byte at a time cannot hold a stream for ever either. A stalled or overlong
+upload gets `DEADLINE_EXCEEDED`, not an in-band `error` event — the contract's
+error taxonomy mirrors lol-html's, and a slow client is not a parse failure.
+The stream cap is per-process and per-parser, orthogonal to tonic's
+per-connection `max_concurrent_streams` (1024): each open stream is a parser
+instance with its own buffers, so an unbounded count would be an unbounded
+memory commitment.
 
 The send timeout is the same idea in the other direction, and idle in the same
 way: every response the client takes starts it over, so a slow reader never
@@ -401,7 +407,7 @@ needs neither buf nor protoc.
 
 ```bash
 cargo build --release
-cargo test                                              # 84 tests
+cargo test                                              # 86 tests
 cargo clippy --all-targets --all-features -- -Dwarnings
 buf lint && buf build
 buf generate                                            # regenerate src/gen
