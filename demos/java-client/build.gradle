@@ -30,6 +30,13 @@ dependencies {
     // Supplies @Generated to the grpc-java generated code, which needs it at
     // compile time and never at run time.
     compileOnly 'org.apache.tomcat:annotations-api:6.0.53'
+
+    // The test runs the demo against an in-process server that never
+    // answers, to hold it to its deadlines.
+    testImplementation "io.grpc:grpc-inprocess:${grpcVersion}"
+    testImplementation 'org.junit.jupiter:junit-jupiter:6.1.3'
+    testImplementation 'org.assertj:assertj-core:3.27.7'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:6.1.3'
 }
 
 sourceSets {
@@ -70,6 +77,10 @@ application {
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
     options.release = 17
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
 }
 
 // The demo writes its event feed to stdout and is diffed against the Node and
