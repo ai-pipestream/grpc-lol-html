@@ -117,9 +117,15 @@ commitment.
 
 The send timeout is the same idea in the other direction, and idle in the same
 way: every response the client takes starts it over, so a slow reader never
-reaches it. Events wait in a per-stream buffer bounded in bytes; when it is
-full the parse waits for the client, and so does the reading of the upload.
-A client that takes nothing for the send timeout gets `RESOURCE_EXHAUSTED`,
+reaches it. A response is taken as soon as the transport has room for it, and
+a text node of megabytes can take longer than the timeout to read, so the
+timeout starts over only once the client could have read what it took at
+64 KiB/s. A client reading at least that fast is never cut off mid-response;
+one that stops reading keeps its slot past the timeout for as long as its
+largest recent response takes at that rate: 16 seconds a MiB.
+
+Events wait in a per-stream buffer bounded in bytes; when it is full the parse
+waits for the client, and so does the reading of the upload. A client that takes nothing for the send timeout gets `RESOURCE_EXHAUSTED`,
 its unsent events are discarded, and its stream slot goes back to the pool,
 so 64 clients that never read cannot lock the service out. Set the buffer
 below 64 KiB and events go out in DATA frames small enough for some HTTP/2
@@ -390,7 +396,7 @@ needs neither buf nor protoc.
 
 ```bash
 cargo build --release
-cargo test                                              # 78 tests
+cargo test                                              # 80 tests
 cargo clippy --all-targets --all-features -- -Dwarnings
 buf lint && buf build
 buf generate                                            # regenerate src/gen

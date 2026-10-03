@@ -26,6 +26,19 @@
 //! the call. The wait is idle, not total: every event the client takes starts
 //! it over, so a slow reader is never mistaken for a stuck one.
 //!
+//! Progress is counted in events, but reading is done in bytes. An event is
+//! taken the moment it is handed to the transport, and the transport takes
+//! no more until the client has read most of what it holds, which for a text
+//! node of megabytes can take longer than the send timeout without anything
+//! being wrong. So the timeout starts only once the client could have read
+//! each event handed over, on its own, at [`MIN_READ_RATE`]: a client reading
+//! at least that fast is never cut off mid-event, and one that has stopped
+//! reading is cut off at most the largest recent event's reading time later
+//! than the timeout alone would cut it off. Events are not added up, so a
+//! client that reads quickly and then stops has banked no more than that,
+//! and the many small events a transport can hold are what the timeout
+//! itself is for.
+//!
 //! An abort discards what is queued at once and leaves only the status. Left
 //! in place, the backlog would live as long as the HTTP/2 stream, which a
 //! client that never reads can keep open for as long as it likes, long after
@@ -70,6 +83,16 @@ type Item = Result<pb::ExtractResponse, Status>;
 /// on a batch that is not coming.
 const RELEASE_BYTES: usize = 32 * 1024;
 
+/// The slowest a client may read one event without being taken for one that
+/// has stopped, in bytes per second.
+///
+/// The send timeout starts once the client could have read each event it has
+/// been handed at this rate, so this bounds how slowly a large event may be
+/// read, and with it how long a client that stops reading partway through one
+/// keeps its stream past the timeout: a 1 MiB event adds 16 seconds, and a
+/// 64 MiB text node, the largest the default memory limit lets through, 1024.
+pub const MIN_READ_RATE: u64 = 64 * 1024;
+
 /// Create a queue that holds at most `capacity` bytes of events, returning
 /// its producer handle and the stream tonic sends from.
 pub fn channel(capacity: usize) -> (Outbound, OutboundStream) {
@@ -92,6 +115,8 @@ pub fn channel(capacity: usize) -> (Outbound, OutboundStream) {
         }),
         batch: Mutex::new(Batch::default()),
         taken: AtomicU64::new(0),
+        epoch: Instant::now(),
+        read_by: AtomicU64::new(0),
         room: Condvar::new(),
         progress: Notify::new(),
     });
@@ -111,7 +136,8 @@ pub fn channel(capacity: usize) -> (Outbound, OutboundStream) {
 pub enum SendError {
     /// The response stream is gone, or the call has already ended.
     Closed,
-    /// The client took nothing for the whole send timeout.
+    /// The client took nothing for the whole send timeout, counted from when
+    /// it could have read what it took at [`MIN_READ_RATE`].
     Stalled {
         /// Bytes waiting in the queue when the wait gave up.
         queued_bytes: usize,
@@ -125,7 +151,8 @@ pub enum Delivery {
     Delivered,
     /// The response stream is gone.
     Gone,
-    /// The client took nothing for the whole send timeout.
+    /// The client took nothing for the whole send timeout, counted from when
+    /// it could have read what it took at [`MIN_READ_RATE`].
     Stalled,
 }
 
@@ -160,6 +187,12 @@ struct Shared {
     /// Events the stream has handed over. A waiter that sees this move knows
     /// the client is still reading.
     taken: AtomicU64,
+    /// Where [`Shared::read_by`] counts from.
+    epoch: Instant,
+    /// When a client reading at [`MIN_READ_RATE`] will have read the events
+    /// handed over so far, each on its own, in nanoseconds after `epoch`.
+    /// Only the stream writes it, before `taken` moves.
+    read_by: AtomicU64,
     /// Signalled when room is made and a producer is waiting.
     room: Condvar,
     /// Signalled when the terminal item is taken, or the stream goes away,
@@ -167,18 +200,38 @@ struct Shared {
     progress: Notify,
 }
 
+/// One event waiting to be handed over.
+struct Queued {
+    item: Item,
+    /// Bytes charged against the queue's bound.
+    charged: usize,
+    /// Its encoded size, which is what the client has to read.
+    size: u64,
+}
+
+impl Queued {
+    /// An item that is not charged against the bound.
+    fn free(item: Item) -> Self {
+        Self {
+            item,
+            charged: 0,
+            size: 0,
+        }
+    }
+}
+
 /// The events the stream took in one go and is handing over.
 #[derive(Default)]
 struct Batch {
-    items: VecDeque<(Item, usize)>,
+    items: VecDeque<Queued>,
     /// Bytes charged to `items`. They stay counted in [`State::queued`] until
     /// the whole batch has been handed over.
     bytes: usize,
 }
 
 struct State {
-    /// Events not yet taken, each with the bytes it was charged.
-    queue: VecDeque<(Item, usize)>,
+    /// Events not yet taken.
+    queue: VecDeque<Queued>,
     /// Bytes charged to everything in `queue` and in the stream's batch.
     queued: usize,
     /// How many events at the front of `queue` the stream may take.
@@ -212,8 +265,22 @@ impl Shared {
         self.batch.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn taken(&self) -> u64 {
-        self.taken.load(Ordering::Relaxed)
+    /// Events taken so far, and when a client reading at [`MIN_READ_RATE`]
+    /// will have read them.
+    fn progress(&self) -> (u64, Instant) {
+        let taken = self.taken.load(Ordering::Acquire);
+        let read_by = Duration::from_nanos(self.read_by.load(Ordering::Relaxed));
+        (taken, self.epoch + read_by)
+    }
+
+    /// Account for an event of `size` encoded bytes handed over to the
+    /// transport.
+    fn hand_over(&self, size: u64) {
+        let read = nanos(self.epoch.elapsed()).saturating_add(reading_nanos(size));
+        // Later than an earlier, larger event the client may still be
+        // reading, never earlier.
+        self.read_by.fetch_max(read, Ordering::Relaxed);
+        self.taken.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -262,7 +329,8 @@ impl Outbound {
         response: pb::ExtractResponse,
         timeout: Duration,
     ) -> Result<(), SendError> {
-        let cost = cost(&response).min(self.shared.capacity);
+        let size = response.encoded_len();
+        let cost = cost(&response, size).min(self.shared.capacity);
         let mut state = self.shared.lock();
         // Started lazily, so the common case of a queue with room never reads
         // the clock.
@@ -274,13 +342,14 @@ impl Outbound {
             }
 
             let now = Instant::now();
-            let taken = self.shared.taken();
+            let (taken, read_by) = self.shared.progress();
             let deadline = match wait {
                 // The client took nothing since the last look.
                 Some((seen, deadline)) if seen == taken => deadline,
-                // It did, so it is reading, and the wait starts over.
+                // It did, so it is reading, and the wait starts over once it
+                // has had time to read what it took.
                 _ => {
-                    let deadline = now + timeout;
+                    let deadline = now.max(read_by) + timeout;
                     wait = Some((taken, deadline));
                     deadline
                 }
@@ -314,7 +383,11 @@ impl Outbound {
             return Err(SendError::Closed);
         }
         state.producer_waiting = false;
-        state.queue.push_back((Ok(response), cost));
+        state.queue.push_back(Queued {
+            item: Ok(response),
+            charged: cost,
+            size: size as u64,
+        });
         state.queued += cost;
         state.unreleased += cost;
         let waker = if state.unreleased >= self.shared.release_bytes {
@@ -352,9 +425,9 @@ impl Outbound {
         }
         // Nothing follows a terminal item, so a queued failure is the last
         // thing in the queue or, if the stream has taken it, in the batch.
-        let kept = if matches!(state.queue.back(), Some((Err(_), _))) {
+        let kept = if matches!(state.queue.back(), Some(Queued { item: Err(_), .. })) {
             state.queue.pop_back()
-        } else if matches!(batch.items.back(), Some((Err(_), _))) {
+        } else if matches!(batch.items.back(), Some(Queued { item: Err(_), .. })) {
             batch.items.pop_back()
         } else {
             None
@@ -365,7 +438,9 @@ impl Outbound {
         );
         batch.bytes = 0;
         state.queued = 0;
-        state.queue.push_back(kept.unwrap_or((Err(status), 0)));
+        state
+            .queue
+            .push_back(kept.unwrap_or_else(|| Queued::free(Err(status))));
         state.ended = true;
         let waker = state.release();
         let producer_waiting = std::mem::take(&mut state.producer_waiting);
@@ -385,7 +460,8 @@ impl Outbound {
     /// Wait until the response stream has taken the call's terminal item.
     ///
     /// Gives up once the client has taken nothing for `timeout`; like the
-    /// wait for room, every event taken starts the wait over.
+    /// wait for room, every event taken starts the wait over, once the client
+    /// has had time to read it.
     pub async fn delivered(&self, timeout: Duration) -> Delivery {
         let mut wait: Option<(u64, tokio::time::Instant)> = None;
         loop {
@@ -408,7 +484,7 @@ impl Outbound {
                     return Delivery::Gone;
                 }
                 let now = tokio::time::Instant::now();
-                let taken = self.shared.taken();
+                let (taken, read_by) = self.shared.progress();
                 let deadline = match wait {
                     Some((seen, deadline)) if seen == taken => {
                         if now >= deadline {
@@ -418,7 +494,7 @@ impl Outbound {
                         deadline
                     }
                     _ => {
-                        let deadline = now + timeout;
+                        let deadline = now.max(read_by.into()) + timeout;
                         wait = Some((taken, deadline));
                         deadline
                     }
@@ -447,7 +523,7 @@ impl Outbound {
         if is_terminal(&item) {
             state.ended = true;
         }
-        state.queue.push_back((item, 0));
+        state.queue.push_back(Queued::free(item));
         let waker = state.release();
         drop(state);
         if let Some(waker) = waker {
@@ -507,7 +583,7 @@ impl Stream for OutboundStream {
             } else {
                 batch.items.extend(state.queue.drain(..released));
             }
-            batch.bytes = batch.items.iter().map(|(_, cost)| cost).sum();
+            batch.bytes = batch.items.iter().map(|queued| queued.charged).sum();
             let producer_waiting = std::mem::take(&mut state.producer_waiting);
 
             if batch.items.is_empty() {
@@ -541,11 +617,11 @@ impl Stream for OutboundStream {
             }
         }
 
-        let Some((item, _)) = batch.items.pop_front() else {
+        let Some(Queued { item, size, .. }) = batch.items.pop_front() else {
             unreachable!("a batch that was just refilled is not empty");
         };
         drop(batch);
-        this.shared.taken.fetch_add(1, Ordering::Relaxed);
+        this.shared.hand_over(size);
 
         if is_terminal(&item) {
             this.done = true;
@@ -602,7 +678,19 @@ const fn is_terminal(item: &Item) -> bool {
     )
 }
 
-/// What one queued event is charged against the queue's bound.
+/// How long a client reading at [`MIN_READ_RATE`] takes to read `bytes`, in
+/// nanoseconds.
+const fn reading_nanos(bytes: u64) -> u64 {
+    bytes.saturating_mul(1_000_000_000) / MIN_READ_RATE
+}
+
+/// `duration` in nanoseconds, saturating.
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// What one queued event is charged against the queue's bound, given its
+/// encoded size.
 ///
 /// Its encoded size alone would undercount badly: a matched `<a>` is a few
 /// dozen bytes on the wire and several hundred in memory once the message
@@ -610,14 +698,12 @@ const fn is_terminal(item: &Item) -> bool {
 /// message and of each attribute are added, which keeps a queue of tiny
 /// events honest and makes no difference to a large text node, where the
 /// text dominates.
-fn cost(response: &pb::ExtractResponse) -> usize {
+fn cost(response: &pb::ExtractResponse, encoded_len: usize) -> usize {
     let attributes = match &response.event {
         Some(pb::extract_response::Event::Element(element)) => element.attributes.len(),
         _ => 0,
     };
-    response.encoded_len()
-        + size_of::<pb::ExtractResponse>()
-        + attributes * size_of::<pb::Attribute>()
+    encoded_len + size_of::<pb::ExtractResponse>() + attributes * size_of::<pb::Attribute>()
 }
 
 #[cfg(test)]
@@ -634,6 +720,11 @@ mod tests {
                 ..Default::default()
             })),
         }
+    }
+
+    /// What `event` is charged against the bound.
+    fn charge(event: &pb::ExtractResponse) -> usize {
+        cost(event, event.encoded_len())
     }
 
     fn finished() -> pb::extract_response::Event {
@@ -701,7 +792,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_queue_holds_the_producer_until_the_stream_takes_an_event() {
         let event = text("x");
-        let (tx, mut rx) = channel(cost(&event));
+        let (tx, mut rx) = channel(charge(&event));
         tx.send_blocking(event.clone(), Duration::from_secs(5))
             .unwrap();
 
@@ -748,7 +839,7 @@ mod tests {
     #[test]
     fn a_producer_facing_a_stream_nobody_reads_gives_up_after_the_timeout() {
         let event = text("x");
-        let (tx, _rx) = channel(cost(&event));
+        let (tx, _rx) = channel(charge(&event));
         tx.send_blocking(event.clone(), Duration::from_secs(5))
             .unwrap();
 
@@ -759,10 +850,54 @@ mod tests {
         assert_eq!(
             err,
             SendError::Stalled {
-                queued_bytes: cost(&event)
+                queued_bytes: charge(&event)
             }
         );
         assert!(started.elapsed() >= Duration::from_millis(100));
+    }
+
+    /// The wait allows for the last event taken to be read at the slowest
+    /// rate a client is held to, so a large event the client is still reading
+    /// is not mistaken for a client that has stopped.
+    #[tokio::test]
+    async fn a_large_event_in_flight_extends_the_wait_by_its_reading_time() {
+        let large = text(&"l".repeat(16 * 1024));
+        let reading = Duration::from_nanos(reading_nanos(large.encoded_len() as u64));
+        assert!(reading >= Duration::from_millis(250));
+
+        let (tx, mut rx) = channel(charge(&large));
+        tx.send_blocking(large, Duration::from_secs(5)).unwrap();
+        tx.flush();
+        assert_eq!(body(rx.next().await).len(), 16 * 1024);
+
+        // The stream has handed the large event over and takes nothing more,
+        // as it would while the client reads it.
+        let small = text("s");
+        let (sent, waited) = tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            let sent = tx.send_blocking(small, Duration::from_millis(50));
+            (sent, started.elapsed())
+        })
+        .await
+        .unwrap();
+        assert!(matches!(sent, Err(SendError::Stalled { .. })));
+        assert!(waited >= reading, "gave up after {waited:?}");
+
+        let (tx, mut rx) = channel(1 << 20);
+        tx.send_blocking(text(&"l".repeat(16 * 1024)), Duration::from_secs(5))
+            .unwrap();
+        assert!(tx.push(finished()));
+        assert_eq!(body(rx.next().await).len(), 16 * 1024);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            tx.delivered(Duration::from_millis(50)).await,
+            Delivery::Stalled
+        );
+        assert!(
+            started.elapsed() >= reading,
+            "gave up after {:?}",
+            started.elapsed()
+        );
     }
 
     /// A client that goes away releases a waiting producer at once rather
@@ -770,7 +905,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_stream_releases_a_waiting_producer() {
         let event = text("x");
-        let (tx, rx) = channel(cost(&event));
+        let (tx, rx) = channel(charge(&event));
         tx.send_blocking(event.clone(), Duration::from_secs(5))
             .unwrap();
 
@@ -903,6 +1038,6 @@ mod tests {
                 ..Default::default()
             })),
         };
-        assert!(cost(&element) > 4 * element.encoded_len());
+        assert!(charge(&element) > 4 * element.encoded_len());
     }
 }

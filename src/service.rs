@@ -91,7 +91,10 @@ pub const DEFAULT_IDLE_TIMEOUT_MS: usize = 60_000;
 /// The counterpart of the idle timeout, for the other direction, and idle
 /// rather than total in the same way: every response the client takes starts
 /// it over, so a slow reader never reaches it and only one that has stopped
-/// reading does. In practice that is a client that uploads the whole document
+/// reading does. It starts over only once the client has had time to read
+/// what it took at [`outbound::MIN_READ_RATE`], so a response of megabytes
+/// that takes longer than this to read is not mistaken for a client that has
+/// stopped. In practice that is a client that uploads the whole document
 /// before reading anything. Once the output outgrows the outbound buffer and
 /// the transport's windows, such a client and any bounded server wait on each
 /// other forever; this turns the wait into `RESOURCE_EXHAUSTED` and gives the

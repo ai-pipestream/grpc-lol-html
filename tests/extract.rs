@@ -1748,6 +1748,98 @@ async fn a_client_that_never_reads_gives_its_stream_slot_back() {
     drop(unread);
 }
 
+/// A TCP proxy to `upstream` that passes requests through untouched and
+/// responses at `bytes_per_second`, the way a client on a slow link reads.
+async fn throttling_proxy(
+    upstream: std::net::SocketAddr,
+    bytes_per_second: usize,
+) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let server = tokio::net::TcpStream::connect(upstream)
+                .await
+                .expect("connect upstream");
+            let (mut client_read, mut client_write) = client.into_split();
+            let (mut server_read, mut server_write) = server.into_split();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut client_read, &mut server_write).await;
+            });
+            tokio::spawn(async move {
+                let mut buffer = vec![0; 8 * 1024];
+                loop {
+                    let n = match server_read.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    if client_write.write_all(&buffer[..n]).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(
+                        n as f64 / bytes_per_second as f64,
+                    ))
+                    .await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// A client reading one large event slowly is still reading.
+///
+/// The client takes no other event until it has read the one in flight, so
+/// a text node that takes longer to read than the send timeout used to look
+/// like a client that had stopped, and a reader keeping up at 160 KiB/s got
+/// `RESOURCE_EXHAUSTED` partway through its result. The send timeout now
+/// allows for the last event taken to be read at the slowest rate a client
+/// is held to.
+///
+/// Each text node takes about 0.8 s to cross the proxy, four times the send
+/// timeout and well inside what it is extended by. The client's small window
+/// keeps the server from running ahead of the proxy into its buffers; the
+/// last node is still in flight when the parse ends, so the wait for the
+/// result is covered as well as the wait for room.
+#[tokio::test]
+async fn a_client_slowly_reading_one_large_event_is_not_taken_for_one_that_stopped() {
+    let server = serve(
+        LolHtmlGrpc::new()
+            .with_outbound_buffer_bytes(64 * 1024)
+            .with_send_timeout(std::time::Duration::from_millis(200))
+            .into_service(),
+    )
+    .await;
+    let proxy = throttling_proxy(server, 160 * 1024).await;
+    let client = connect_with_window(proxy, 64 * 1024).await;
+
+    let node = "t".repeat(128 * 1024);
+    let document = format!("<p>{node}</p>").repeat(3);
+    let options = pb::ExtractOptions {
+        rules: vec![pb::ExtractRule {
+            id: "p".to_owned(),
+            selector: "p".to_owned(),
+            captures: vec![pb::Capture::Text as i32],
+        }],
+        ..Default::default()
+    };
+
+    let events = extract(&client, document.as_bytes(), options, 64 * 1024)
+        .await
+        .expect("a client that keeps reading must get its whole result");
+    let texts = only!(events, Event::Text);
+    assert_eq!(texts.len(), 3);
+    assert!(texts.iter().all(|text| text.text == node));
+    assert!(matches!(
+        events.last().and_then(|e| e.event.as_ref()),
+        Some(Event::Finished(_))
+    ));
+}
+
 /// Backpressure inside one chunk is invisible to a client that reads.
 ///
 /// With an outbound buffer far smaller than one chunk's events, the parse
