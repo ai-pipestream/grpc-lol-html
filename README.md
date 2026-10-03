@@ -272,19 +272,22 @@ by streaming a second document through afterwards.
 **And the caller does not get the last word on it.** A request can lower its
 limit but not raise it past the server's ceiling, `GRPC_LOL_HTML_MAX_MEMORY_BYTES`
 (64 MiB by default); asking for more gets the ceiling, so no caller can switch
-the parser's memory guard off by asking for `u64::MAX`. The same limit covers
-the text the server holds while reassembling text nodes, summed across rules,
-which lol-html's own accounting never sees. A preallocation larger than the
-limit is cut to it.
+the parser's memory guard off by asking for `u64::MAX`. The text the server
+holds while reassembling text nodes, summed across rules, is something
+lol-html's own accounting never sees, so it has a budget of its own of the
+same size: a call can hold up to twice its limit, the parser's state and the
+text beside it. A preallocation larger than the limit is cut to it.
 
-**Every buffer a call can fill has a bound.** Parser state and reassembled
-text: the memory limit. Unsent events: the outbound buffer, 8 MiB per stream,
-with the parse waiting on the client beyond that, and the call ended after the
-send timeout if the client takes nothing. One inbound chunk: the chunk cap. The
-work and the output per element: at most 256 rules, with ids of at most 256
-bytes and selectors of at most 4096. So a stream's memory has a ceiling set by
-configuration, and the process's by that times the stream cap; nothing in
-between depends on what the document says or how long it is.
+**Every buffer a call can fill has a bound.** Parser state, and separately
+reassembled text: the memory limit each. Unsent events: the outbound buffer,
+8 MiB per stream, with the parse waiting on the client beyond that, and the
+call ended after the send timeout if the client takes nothing. One event
+larger than the whole buffer still goes out, alone, so a single text node can
+take the buffer past its bound up to the memory limit. One inbound chunk: the
+chunk cap. The work and the output per element: at most 256 rules, with ids
+of at most 256 bytes and selectors of at most 4096. So a stream's memory has a
+ceiling set by configuration, and the process's by that times the stream cap;
+nothing in between depends on what the document says or how long it is.
 
 **UTF-16 is refused up front.** lol-html's tokenizer scans for ASCII markup
 bytes, so UTF-16LE/BE, ISO-2022-JP and `replacement` are rejected with
