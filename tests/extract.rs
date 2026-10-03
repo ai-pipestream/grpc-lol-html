@@ -1748,6 +1748,83 @@ async fn a_client_that_never_reads_gives_its_stream_slot_back() {
     drop(unread);
 }
 
+/// A client that finishes its upload and never reads keeps its stream slot
+/// only for the send timeout after the parse ends, not until it reads.
+///
+/// The parse of a small upload finishes with all of its events queued, well
+/// inside the default outbound buffer, so it never waits for room. What is
+/// left is the wait for the client to take the result, and that wait has to
+/// hold the slot, since the queued events are the memory the slot accounts
+/// for, and then give up: a second client is refused while it lasts and
+/// accepted once the send timeout has passed, and the first client, when it
+/// does read, finds the call ended rather than its discarded events.
+///
+/// The second client tries halfway through the send timeout, by when the
+/// parse of a few thousand elements has long finished, so the refusal is the
+/// wait's and not the parse's.
+#[tokio::test]
+async fn a_client_that_never_reads_its_result_gives_the_slot_back_after_the_parse() {
+    let send_timeout = std::time::Duration::from_millis(400);
+    let addr = serve(
+        LolHtmlGrpc::new()
+            .with_max_concurrent_streams(1)
+            .with_send_timeout(send_timeout)
+            .into_service(),
+    )
+    .await;
+    let mut stuck = connect_with_window(addr, 16 * 1024).await;
+    let client = connect_with_window(addr, 1 << 20).await;
+
+    // Over 100 KiB of events, several times what the client's window and the
+    // server's send buffer hold, so the result cannot reach the client
+    // without its reading, and about a MiB charged, far less than the
+    // buffer, so the parse never waits.
+    let mut frames = vec![options_frame(every_anchor())];
+    frames.extend(anchors(40 * 1024).chunks(16 * 1024).map(chunk_frame));
+    let mut unread = stuck
+        .extract(tokio_stream::iter(frames))
+        .await
+        .expect("the first call opens")
+        .into_inner();
+
+    tokio::time::sleep(send_timeout / 2).await;
+    let refused = extract(&client, b"<a>", every_anchor(), 64)
+        .await
+        .expect_err("the slot is held while the result waits for the client");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+
+    let started = std::time::Instant::now();
+    let mut accepted = false;
+    while started.elapsed() < std::time::Duration::from_secs(1) {
+        match extract(&client, b"<a x=\"1\">", every_anchor(), 64).await {
+            Ok(_) => {
+                accepted = true;
+                break;
+            }
+            Err(status) => assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        accepted,
+        "the slot should come back within a second of the send timeout"
+    );
+
+    let mut events = 0;
+    let status = loop {
+        match unread.message().await {
+            Ok(Some(_)) => events += 1,
+            Ok(None) => panic!("the call ended OK after {events} events, though it was ended"),
+            Err(status) => break status,
+        }
+    };
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert!(
+        events < 40 * 1024 / 9,
+        "only what the transport already held should arrive, got {events} events"
+    );
+}
+
 /// A TCP proxy to `upstream` that passes requests through untouched and
 /// responses at `bytes_per_second`, the way a client on a slow link reads.
 async fn throttling_proxy(

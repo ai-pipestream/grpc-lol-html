@@ -396,7 +396,7 @@ needs neither buf nor protoc.
 
 ```bash
 cargo build --release
-cargo test                                              # 80 tests
+cargo test                                              # 81 tests
 cargo clippy --all-targets --all-features -- -Dwarnings
 buf lint && buf build
 buf generate                                            # regenerate src/gen
