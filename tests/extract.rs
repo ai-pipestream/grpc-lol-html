@@ -60,6 +60,45 @@ async fn start_server() -> LolHtmlServiceClient<Channel> {
 async fn start_configured_server(
     service: pb::lol_html_service_server::LolHtmlServiceServer<LolHtmlGrpc>,
 ) -> LolHtmlServiceClient<Channel> {
+    let addr = serve(service).await;
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .expect("connect to server");
+    LolHtmlServiceClient::new(channel)
+}
+
+/// Like [`start_configured_server`], with a client whose HTTP/2 receive
+/// windows are `window` bytes, so that a client which does not read backs the
+/// server up after kilobytes rather than megabytes.
+async fn start_server_with_client_window(
+    service: pb::lol_html_service_server::LolHtmlServiceServer<LolHtmlGrpc>,
+    window: u32,
+) -> LolHtmlServiceClient<Channel> {
+    connect_with_window(serve(service).await, window).await
+}
+
+/// A client on its own connection, with HTTP/2 receive windows of `window`
+/// bytes.
+async fn connect_with_window(
+    addr: std::net::SocketAddr,
+    window: u32,
+) -> LolHtmlServiceClient<Channel> {
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .initial_stream_window_size(window)
+        .initial_connection_window_size(window)
+        .connect()
+        .await
+        .expect("connect to server");
+    LolHtmlServiceClient::new(channel)
+}
+
+/// Serve `service` on an ephemeral localhost port.
+async fn serve(
+    service: pb::lol_html_service_server::LolHtmlServiceServer<LolHtmlGrpc>,
+) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
@@ -71,12 +110,7 @@ async fn start_configured_server(
             .await
             .expect("server failed");
     });
-    let channel = Endpoint::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .expect("connect to server");
-    LolHtmlServiceClient::new(channel)
+    addr
 }
 
 /// A rule asking for everything, which is what most tests want.
@@ -1562,6 +1596,281 @@ async fn streams_past_the_concurrency_cap_fail_fast() {
     assert!(
         reopened.is_some(),
         "the permit should be released when the first stream ends"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Clients that stop reading
+// ---------------------------------------------------------------------------
+
+/// The options frame.
+fn options_frame(options: pb::ExtractOptions) -> pb::ExtractRequest {
+    pb::ExtractRequest {
+        frame: Some(pb::extract_request::Frame::Options(options)),
+    }
+}
+
+/// One chunk of document bytes.
+fn chunk_frame(bytes: &[u8]) -> pb::ExtractRequest {
+    pb::ExtractRequest {
+        frame: Some(pb::extract_request::Frame::Chunk(bytes.to_vec())),
+    }
+}
+
+/// `bytes` of `<a x="1">`, repeated: one matched element every nine bytes.
+fn anchors(bytes: usize) -> Vec<u8> {
+    b"<a x=\"1\">".iter().copied().cycle().take(bytes).collect()
+}
+
+/// Options matching every anchor, with its tag and attributes.
+fn every_anchor() -> pb::ExtractOptions {
+    pb::ExtractOptions {
+        rules: vec![pb::ExtractRule {
+            id: "a".to_owned(),
+            selector: "a".to_owned(),
+            captures: vec![pb::Capture::TagName as i32, pb::Capture::Attributes as i32],
+        }],
+        ..Default::default()
+    }
+}
+
+/// A client that uploads the whole document before it reads anything gets a
+/// status it can act on, instead of a hang.
+///
+/// That client used to wedge the server for good. The outbound buffer filled,
+/// the server stopped reading the upload, the upload blocked on the full
+/// HTTP/2 window, and neither side moved again until the client's own
+/// deadline, with a stream slot held throughout. Now the server gives up
+/// after the send timeout, keeps reading the upload so the client can finish
+/// it, and the client's first read ends in `RESOURCE_EXHAUSTED`, never OK.
+#[tokio::test]
+async fn a_client_that_reads_only_after_uploading_gets_resource_exhausted_not_a_hang() {
+    let mut client = start_server_with_client_window(
+        LolHtmlGrpc::new()
+            .with_outbound_buffer_bytes(64 * 1024)
+            .with_send_timeout(std::time::Duration::from_secs(1))
+            .into_service(),
+        64 * 1024,
+    )
+    .await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tx.send(options_frame(every_anchor())).await.unwrap();
+    let mut stream = client
+        .extract(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .expect("open the call")
+        .into_inner();
+
+    // Twice the server's 1 MiB receive window, and hundreds of thousands of
+    // events, far more than every buffer between the parse and this client
+    // holds: the upload cannot finish unless the server keeps reading it.
+    let document = anchors(2 << 20);
+    let upload = async move {
+        for chunk in document.chunks(64 * 1024) {
+            tx.send(chunk_frame(chunk)).await.unwrap();
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), upload)
+        .await
+        .expect("the upload must be able to finish without the client reading");
+
+    let mut events = 0;
+    let status = loop {
+        match stream.message().await {
+            Ok(Some(_)) => events += 1,
+            Ok(None) => {
+                panic!("the call ended OK after {events} events, though nobody read in time")
+            }
+            Err(status) => break status,
+        }
+    };
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert!(
+        status.message().contains("while uploading"),
+        "the status should say what to do: {}",
+        status.message()
+    );
+}
+
+/// A client that never reads does not get to keep its stream slot.
+///
+/// With room for one stream, a second client's call is refused while the
+/// first is live, and is accepted once the first client has taken nothing
+/// for the send timeout, though it neither reads nor closes its call. The
+/// two are on separate connections, as separate clients are: on a shared one
+/// the unread stream would fill the connection's own flow-control window and
+/// starve the other of data, which is HTTP/2's doing and not the server's.
+#[tokio::test]
+async fn a_client_that_never_reads_gives_its_stream_slot_back() {
+    let addr = serve(
+        LolHtmlGrpc::new()
+            .with_max_concurrent_streams(1)
+            .with_outbound_buffer_bytes(16 * 1024)
+            .with_send_timeout(std::time::Duration::from_millis(200))
+            .into_service(),
+    )
+    .await;
+    let mut stuck = connect_with_window(addr, 64 * 1024).await;
+    let client = connect_with_window(addr, 1 << 20).await;
+
+    // Small enough to upload in full, dense enough that its events overflow
+    // every buffer between the parse and a client that is not reading.
+    let mut frames = vec![options_frame(every_anchor())];
+    frames.extend(anchors(512 * 1024).chunks(64 * 1024).map(chunk_frame));
+    let unread = stuck
+        .extract(tokio_stream::iter(frames))
+        .await
+        .expect("the first call opens")
+        .into_inner();
+
+    let refused = extract(&client, b"<a>", every_anchor(), 64)
+        .await
+        .expect_err("the only slot is taken");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+
+    let mut accepted = None;
+    for _ in 0..100 {
+        match extract(&client, b"<a x=\"1\">", every_anchor(), 64).await {
+            Ok(events) => {
+                accepted = Some(events);
+                break;
+            }
+            Err(status) => assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let events = accepted.expect("the slot should come back once the first client stopped reading");
+    assert!(matches!(
+        events.last().and_then(|e| e.event.as_ref()),
+        Some(Event::Finished(_))
+    ));
+    drop(unread);
+}
+
+/// Backpressure inside one chunk is invisible to a client that reads.
+///
+/// With an outbound buffer far smaller than one chunk's events, the parse
+/// stops mid-chunk to wait for the client over and over. The stream that
+/// comes out must still be identical, event for event, to the one the
+/// default buffer produces.
+#[tokio::test]
+async fn backpressure_inside_a_chunk_changes_nothing_a_reading_client_sees() {
+    let roomy = start_server().await;
+    let tight = start_configured_server(
+        LolHtmlGrpc::new()
+            .with_outbound_buffer_bytes(16 * 1024)
+            .into_service(),
+    )
+    .await;
+
+    let mut document = Vec::new();
+    for n in 0..20_000 {
+        document.extend_from_slice(
+            format!("<p id=\"p{n}\" class=\"c\">paragraph {n} &amp; more</p><!-- {n} -->")
+                .as_bytes(),
+        );
+    }
+
+    for chunk_size in [64 * 1024, usize::MAX] {
+        let expected = extract(&roomy, &document, everything(), chunk_size)
+            .await
+            .expect("the default buffer");
+        let actual = extract(&tight, &document, everything(), chunk_size)
+            .await
+            .expect("the tight buffer");
+        assert!(
+            expected.len() > 50_000,
+            "the document should produce many events, got {}",
+            expected.len()
+        );
+        assert!(
+            expected == actual,
+            "at chunk size {chunk_size} the tight buffer produced a different stream \
+             ({} events against {})",
+            actual.len(),
+            expected.len()
+        );
+    }
+}
+
+/// One large chunk is one long parse, and it must not happen where it holds
+/// up everything else.
+///
+/// This test's runtime has a single thread, which the server and every
+/// client call share. A parse on that thread would leave a call made
+/// mid-parse waiting until the parse was done; on the blocking pool the call
+/// is answered while the parse is still going.
+#[tokio::test]
+async fn a_large_chunk_is_parsed_without_holding_up_other_calls() {
+    let client = start_server().await;
+
+    // Expensive to parse and cheap to send: every element is checked against
+    // every rule, and none of them ever matches, so nothing comes back.
+    let rules: Vec<pb::ExtractRule> = (0..64)
+        .map(|n| pb::ExtractRule {
+            id: format!("r{n}"),
+            selector: format!("section.s{n} article[data-k{n}] > span.t{n}"),
+            captures: vec![pb::Capture::TagName as i32],
+        })
+        .collect();
+    let options = pb::ExtractOptions {
+        rules,
+        ..Default::default()
+    };
+    // An optimized build parses an order of magnitude faster, and the
+    // Dockerfile runs this suite as one, so the document grows to keep the
+    // parse long enough to measure against.
+    let size = if cfg!(debug_assertions) {
+        8 << 20
+    } else {
+        32 << 20
+    };
+    let mut document = Vec::with_capacity(size + 64);
+    while document.len() < size {
+        document.extend_from_slice(b"<div class=\"a\"><span data-x=\"1\">text</span></div>");
+    }
+
+    let parse = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let events = extract(&client, &document, options, usize::MAX)
+                .await
+                .expect("extract");
+            assert!(matches!(
+                events.last().and_then(|e| e.event.as_ref()),
+                Some(Event::Finished(_))
+            ));
+            started.elapsed()
+        })
+    };
+
+    let mut probes = 0;
+    let mut slowest = std::time::Duration::ZERO;
+    while !parse.is_finished() {
+        let started = std::time::Instant::now();
+        client
+            .clone()
+            .validate_selectors(pb::ValidateSelectorsRequest {
+                rules: vec![rule("probe", "p")],
+            })
+            .await
+            .expect("a probe call");
+        slowest = slowest.max(started.elapsed());
+        probes += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let total = parse.await.expect("the extract task");
+
+    println!("  extract took {total:?}; {probes} probe calls, the slowest {slowest:?}");
+    assert!(
+        total >= std::time::Duration::from_millis(100),
+        "the parse has to take long enough to measure anything against, took {total:?}"
+    );
+    assert!(
+        slowest < total / 4,
+        "a call made during the parse waited {slowest:?} of the extract's {total:?}"
     );
 }
 

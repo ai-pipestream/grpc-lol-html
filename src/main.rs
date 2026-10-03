@@ -8,14 +8,19 @@
 //! - `GRPC_LOL_HTML_MAX_CHUNK_BYTES` — largest inbound chunk accepted
 //!   (default: 100 MiB). Not a document size limit: a document is any number
 //!   of chunks and has no ceiling. This only bounds how much one message may
-//!   carry, and with it how long a single uninterruptible parse can occupy an
-//!   async worker. Lower it on a host serving many concurrent callers, since
-//!   an in-flight chunk is buffered per call.
+//!   carry, and with it how long a single uninterruptible parse runs. Lower
+//!   it on a host serving many concurrent callers, since an in-flight chunk
+//!   is buffered per call.
 //! - `GRPC_LOL_HTML_WINDOW_BYTES` — HTTP/2 initial stream and connection
 //!   window (default: 4 MiB).
 //! - `GRPC_LOL_HTML_IDLE_TIMEOUT_MS` — how long an open `Extract` stream may
 //!   go without an inbound frame before the server ends it
 //!   (default: 60000).
+//! - `GRPC_LOL_HTML_SEND_TIMEOUT_MS` — how long an open `Extract` stream may
+//!   go without its client taking a response while events wait, before the
+//!   server ends it with `RESOURCE_EXHAUSTED` (default: 60000).
+//! - `GRPC_LOL_HTML_OUTBOUND_BUFFER_BYTES` — byte budget for one stream's
+//!   events waiting to be sent (default: 8 MiB).
 //! - `GRPC_LOL_HTML_MAX_MEMORY_BYTES` — ceiling on the memory limit a call
 //!   may ask for in `MemoryLimits.max_bytes`; larger requests get the
 //!   ceiling (default: 64 MiB).
@@ -26,9 +31,10 @@
 //! Logging goes through `tracing`: `RUST_LOG` selects the filter
 //! (default `info`).
 //!
-//! There is no blocking-pool setting, unlike the sibling grpc-calamine
-//! server: parsing happens one bounded chunk at a time on the async task
-//! itself, so there is no pool to size.
+//! Parsing runs on tokio's blocking pool, one chunk per task, and a stream
+//! holds at most one blocking thread at a time. The pool's default ceiling
+//! of 512 threads sits well above the default stream cap, so it is left
+//! alone; raise it only alongside a stream cap in the hundreds.
 
 use std::time::Duration;
 
@@ -111,6 +117,14 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             "GRPC_LOL_HTML_IDLE_TIMEOUT_MS",
             grpc_lol_html::service::DEFAULT_IDLE_TIMEOUT_MS,
         ) as u64))
+        .with_send_timeout(Duration::from_millis(env_usize(
+            "GRPC_LOL_HTML_SEND_TIMEOUT_MS",
+            grpc_lol_html::service::DEFAULT_SEND_TIMEOUT_MS,
+        ) as u64))
+        .with_outbound_buffer_bytes(env_usize(
+            "GRPC_LOL_HTML_OUTBOUND_BUFFER_BYTES",
+            grpc_lol_html::service::DEFAULT_OUTBOUND_BUFFER_BYTES,
+        ))
         .with_max_memory_bytes(env_usize(
             "GRPC_LOL_HTML_MAX_MEMORY_BYTES",
             grpc_lol_html::service::DEFAULT_MEMORY_CEILING_BYTES,

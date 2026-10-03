@@ -13,10 +13,52 @@
 //!   available. That wildcard is the one path by which an unrecognized
 //!   lol-html failure can reach a client as `PARSE_ERROR_CODE_UNSPECIFIED`,
 //!   and it always carries lol-html's own message alongside.
+//!
+//! The server's own content handlers can stop a parse too, and say why with a
+//! [`HandlerStop`]. lol-html hands that back boxed inside
+//! `RewritingError::ContentHandlerError`, so it is matched by downcasting.
+
+use std::fmt;
 
 use lol_html::errors::{RewritingError, SelectorError};
 
 use crate::proto::v1 as pb;
+
+/// Why one of the server's own content handlers stopped the parse.
+#[derive(Debug)]
+pub enum HandlerStop {
+    /// The response stream is gone, so nothing more can be delivered.
+    ClientGone,
+    /// The client took nothing from the outbound queue for the whole send
+    /// timeout.
+    NotReading {
+        /// Bytes of events waiting when the server gave up.
+        queued_bytes: usize,
+    },
+}
+
+impl fmt::Display for HandlerStop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClientGone => f.write_str("the response stream is gone"),
+            Self::NotReading { queued_bytes } => write!(
+                f,
+                "the client stopped reading responses with {queued_bytes} bytes of events waiting"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HandlerStop {}
+
+/// The [`HandlerStop`] behind a parse failure, if one of the server's own
+/// handlers caused it.
+pub fn handler_stop(err: &RewritingError) -> Option<&HandlerStop> {
+    match err {
+        RewritingError::ContentHandlerError(cause) => cause.downcast_ref::<HandlerStop>(),
+        _ => None,
+    }
+}
 
 /// Translate a selector compilation failure into its wire code, plus the
 /// offending character for the one variant that names one.
