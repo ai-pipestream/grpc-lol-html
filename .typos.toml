@@ -1,6 +1,8 @@
 [default.extend-words]
 # Protobuf field/type shorthand mirrored from calamine's public API.
 typ = "typ"
+# "caf&eacute;" in demos/sample-data/entities.html is an entity-decoding fixture.
+caf = "caf"
 
 [files]
 # Generated code is not hand-written prose.
