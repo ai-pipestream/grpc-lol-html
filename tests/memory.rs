@@ -19,6 +19,8 @@
 #![cfg(target_os = "linux")]
 
 use std::process::{Child, Command};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -38,69 +40,88 @@ const CHUNK: usize = 256 * 1024;
 /// measures starting up rather than the thing being claimed.
 const COLD_MIB: usize = 1;
 
-/// The warm-up document, repeated until the peak stops moving.
+/// The warm-up document, repeated until the server's resident set stops
+/// moving, and the size the large document is compared against.
 ///
-/// `VmHWM` is a high-water mark and never falls, so the peak a warm process
-/// settles at is the reference everything after it is measured against.
-/// Warming up takes longer than one small document. mimalloc keeps a heap per
-/// thread, and the parse moves between the async workers and the blocking pool
-/// from one chunk to the next, so the peak keeps climbing until every thread
-/// that will carry the work has held its share of it. On a 4-core machine that
-/// took anywhere from 16 MiB to 128 MiB of document, the settled peak scaled
-/// with the worker count (about 30, 42 and 52 MiB at one, two and four
-/// workers) rather than with the document, and none of it moved again through
-/// 512 MiB. Comparing 64 MiB against 16 MiB, as this test once did, compared
-/// a settled peak with one still warming up and failed one run in ten or
-/// twenty, on any toolchain from 1.97 to 1.99, on differences of up to 17 MiB
-/// that were none of the document's doing.
+/// mimalloc keeps a heap per thread, and the parse moves between the async
+/// workers and the blocking pool from one chunk to the next, so resident memory
+/// keeps climbing until every thread that will carry the work has held its
+/// share of it. On a 4-core machine that took anywhere from 16 MiB to 128 MiB
+/// of document, and it scaled with the worker count (about 30, 42 and 52 MiB
+/// at one, two and four workers) rather than with the document.
 const WARM_UP_MIB: usize = 64;
 
-/// A warm-up run that raises the peak by less than this is a quiet one.
-const SETTLED_BYTES: u64 = 1024 * 1024;
-
-/// How many quiet warm-up runs in a row count as settled.
+/// How many warm-up documents run before anything is measured.
 ///
-/// One is not enough: in forty runs, every one where the large document still
-/// added 3 to 6 MiB had stopped after a single quiet warm-up.
-const SETTLED_RUNS: usize = 2;
-
-/// How many warm-up runs the peak gets to settle in.
-///
-/// Repeating one document cannot grow a server that holds nothing between
-/// calls, so a peak that is still climbing after this many identical runs is
-/// accumulating something across them, and that fails the test on its own.
-const MAX_WARM_UPS: usize = 10;
+/// Settling is not asserted on: what the warm-ups leave behind is the
+/// reference, and the comparisons below are made against it.
+const WARM_UPS: usize = 3;
 
 /// The async worker count this test runs the server with.
 ///
-/// The settled peak grows with the worker count, and so does the time it takes
-/// to settle, so the default of one per core would make the reference depend on
-/// the machine. Four is what the CI runners have and what the numbers above
-/// were measured with.
+/// Settled memory grows with the worker count, so the default of one per core
+/// would make the reference depend on the machine. Four is what the CI runners
+/// have.
 const WORKERS: &str = "4";
 
-/// The outbound buffer and HTTP/2 windows this test runs the server with.
+/// The outbound buffer and HTTP/2 window this test runs the server with.
 ///
 /// Both are bounded by configuration rather than by the document, and both
 /// fill only while the client falls behind, which a test client sharing one
-/// thread with its own uploader does now and then. At the defaults, 8 MiB of
-/// outbound buffer and 4 MiB windows, a rare run where they fill together
-/// lifts the peak by 8 to 10 MiB at whatever point it happens, settled or
-/// not, so the bound itself would be measured rather than the document. At
-/// 1 MiB each, with the settling above, the most the large document added in
-/// seventy runs was 6 MiB and none failed, which leaves the allowance below to
-/// mean what it says.
-const BUFFER_BYTES: &str = "1048576";
+/// thread with its own uploader does now and then. Small ones keep how full
+/// they happen to run out of the reading.
+const BUFFER_BYTES: u64 = 1024 * 1024;
 
-/// The document measured against the settled peak, four times the warm-up.
+/// The document compared against the warm-up sized ones, four times their size.
 const LARGE_MIB: usize = 256;
 
-/// How much peak RSS the large document may add over the settled peak.
+/// How many warm-up sized documents the large one is compared with: the same
+/// number of bytes in documents a quarter of the size.
+const SMALL_DOCUMENTS: usize = LARGE_MIB / WARM_UP_MIB;
+
+/// How many times the comparison runs, interleaved.
 ///
-/// It has to separate "flat" from "proportional". A server that retained the
-/// document would need the full 192 MiB difference between the warm-up and the
-/// large document, so this sits far below that and far above the megabyte or
-/// two that allocator behaviour moves between runs.
+/// The resident set sits several MiB higher while the machine is busy, because
+/// a client that is starved of CPU falls behind and the server's bounded
+/// buffers run fuller. Run back to back, small then large, a burst of load
+/// from anything else on the machine lands on one side and reads as growth.
+/// Interleaved (half the small documents, the large one, the other half, and
+/// again), load that comes and goes over seconds falls on both sides alike.
+const ROUNDS: usize = 2;
+
+/// How much the median may climb from the first round to the last.
+///
+/// This check is not about document size but about state held between calls,
+/// which the interleaving above hides from the size comparison. Round to round
+/// the median wandered between -10 and +7 MiB in 41 runs of a server that
+/// holds nothing, so this sits clear of that. A server keeping 1/16 of every
+/// chunk climbed about 40 MiB and failed every time; one keeping 1/64 climbed
+/// 5 to 12 MiB and is below what this can tell from noise.
+const ALLOWED_CLIMB_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The tests in this file each start a server and stream hundreds of MiB
+/// through it, and run side by side they load the machine for each other.
+/// Holding this for the whole of a test keeps each one's numbers its own.
+static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// How often the server's resident set is sampled while a document streams.
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(2);
+
+/// How much higher the median resident set may sit while the large document
+/// streams than while the same bytes stream as warm-up sized documents.
+///
+/// The comparison is between medians of the resident set sampled throughout,
+/// not between high-water marks. A high-water mark is the single largest moment
+/// of a run. In the image build on 2026-10-20 one such moment, about 10 MiB
+/// above a server that was otherwise flat, failed the high-water versions of
+/// this test in three of the four publish legs that ran them, under conditions
+/// that 220 repeated runs on GitHub runners and on a workstation, the same
+/// multi-arch build among them, never reproduced. A median
+/// does not move for a moment. A server that retained the document grows
+/// through the whole large run: with a copy of every chunk held for the call,
+/// the large side's median sat 147 to 159 MiB up. This sits far below that and
+/// above the -7 to +4 MiB the comparison moved by in 71 runs of a server that
+/// holds nothing.
 const ALLOWED_GROWTH_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How much peak RSS a 128 MiB text node may add over a 64 MiB warm-up.
@@ -127,16 +148,25 @@ impl Drop for ServerProcess {
     }
 }
 
+/// Current resident set size of a process, in bytes.
+fn rss(pid: u32) -> u64 {
+    proc_status_kb(pid, "VmRSS:") * 1024
+}
+
 /// Peak resident set size of a process, in bytes.
 fn peak_rss(pid: u32) -> u64 {
+    proc_status_kb(pid, "VmHWM:") * 1024
+}
+
+/// One kB-valued field of `/proc/<pid>/status`.
+fn proc_status_kb(pid: u32, field: &str) -> u64 {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("read /proc status");
     status
         .lines()
-        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .find_map(|line| line.strip_prefix(field))
         .and_then(|value| value.split_whitespace().next())
         .and_then(|kb| kb.parse::<u64>().ok())
-        .map(|kb| kb * 1024)
-        .expect("VmHWM in /proc status")
+        .unwrap_or_else(|| panic!("{field} in /proc status"))
 }
 
 /// Start the shipped binary on a free port, with `envs` added to its
@@ -352,6 +382,7 @@ async fn stream_text_node(
 /// copy of it.
 #[tokio::test]
 async fn one_enormous_text_node_does_not_grow_the_server() {
+    let _alone = ONE_AT_A_TIME.lock().await;
     // Each raw fragment is a whole upload chunk of text, so the default 8 MiB
     // outbound buffer holds only a few dozen and how full it happens to run
     // swamps the measurement. A 1 MiB buffer is full from the first chunks,
@@ -406,22 +437,55 @@ async fn one_enormous_text_node_does_not_grow_the_server() {
     );
 }
 
-/// Stream a `mib` MiB document, note the peak it leaves in `runs` and return
-/// it.
+/// Stream a `mib` MiB document while sampling the server's resident set, note
+/// the run in `runs` and return the samples.
 async fn measure(
     client: &LolHtmlServiceClient<Channel>,
     pid: u32,
     mib: usize,
     runs: &mut Vec<String>,
-) -> u64 {
+) -> Vec<u64> {
+    let streaming = Arc::new(AtomicBool::new(true));
+    let sampler = {
+        let streaming = Arc::clone(&streaming);
+        std::thread::spawn(move || {
+            let mut samples = Vec::new();
+            while streaming.load(Ordering::Relaxed) {
+                samples.push(rss(pid));
+                std::thread::sleep(SAMPLE_INTERVAL);
+            }
+            samples
+        })
+    };
     let matches = stream_document(client, mib).await;
+    streaming.store(false, Ordering::Relaxed);
+    let samples = sampler.join().expect("the sampler thread");
     assert!(matches > 0, "{mib} MiB produced no matches");
-    let peak = peak_rss(pid);
+    // Where in the run the largest sample fell, so a burst in the report can
+    // be placed against the upload rather than guessed at.
+    let (at, max) = samples
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by_key(|&(_, rss)| rss)
+        .unwrap_or_default();
     runs.push(format!(
-        "{mib} MiB -> {} MiB peak RSS ({matches} matches)",
-        peak / 1024 / 1024
+        "{mib} MiB -> median {} MiB, max {} MiB at {}% RSS ({matches} matches)",
+        median(&samples) / 1024 / 1024,
+        max / 1024 / 1024,
+        at * 100 / samples.len().max(1),
     ));
-    peak
+    samples
+}
+
+/// The median of some samples.
+fn median(samples: &[u64]) -> u64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    sorted
+        .get(sorted.len() / 2)
+        .copied()
+        .expect("at least one sample")
 }
 
 /// Peak server RSS must not track document size.
@@ -432,51 +496,76 @@ async fn measure(
 /// a streaming contract with no handles in it.
 #[tokio::test]
 async fn peak_server_memory_does_not_track_document_size() {
+    let _alone = ONE_AT_A_TIME.lock().await;
+    let buffer = BUFFER_BYTES.to_string();
     let (server, client) = start_server_process(&[
-        ("GRPC_LOL_HTML_OUTBOUND_BUFFER_BYTES", BUFFER_BYTES),
-        ("GRPC_LOL_HTML_WINDOW_BYTES", BUFFER_BYTES),
+        ("GRPC_LOL_HTML_OUTBOUND_BUFFER_BYTES", &buffer),
+        ("GRPC_LOL_HTML_WINDOW_BYTES", &buffer),
         ("GRPC_LOL_HTML_WORKERS", WORKERS),
     ])
     .await;
     let pid = server.0.id();
 
-    let idle = peak_rss(pid);
+    let idle = rss(pid);
     let mut runs = Vec::new();
 
-    let mut settled = measure(&client, pid, COLD_MIB, &mut runs).await;
-    let mut warm_ups = 0;
-    let mut quiet = 0;
-    loop {
-        let peak = measure(&client, pid, WARM_UP_MIB, &mut runs).await;
-        warm_ups += 1;
-        quiet = if peak - settled < SETTLED_BYTES {
-            quiet + 1
-        } else {
-            0
-        };
-        settled = peak;
-        if quiet == SETTLED_RUNS {
-            break;
-        }
-        assert!(
-            warm_ups < MAX_WARM_UPS,
-            "peak RSS had not settled after {MAX_WARM_UPS} identical {WARM_UP_MIB} MiB \
-             documents, which is what holding something between calls would look like: \
-             idle {} MiB; {}",
-            idle / 1024 / 1024,
-            runs.join("; "),
-        );
+    measure(&client, pid, COLD_MIB, &mut runs).await;
+    for _ in 0..WARM_UPS {
+        measure(&client, pid, WARM_UP_MIB, &mut runs).await;
     }
-    let large = measure(&client, pid, LARGE_MIB, &mut runs).await;
 
-    let report = format!("idle {} MiB; {}", idle / 1024 / 1024, runs.join("; "));
+    runs.push("measuring".to_owned());
+    let mut small = Vec::new();
+    let mut large = Vec::new();
+    let mut rounds = Vec::new();
+    for _ in 0..ROUNDS {
+        let mut round = Vec::new();
+        for _ in 0..SMALL_DOCUMENTS / 2 {
+            round.extend(measure(&client, pid, WARM_UP_MIB, &mut runs).await);
+        }
+        let big = measure(&client, pid, LARGE_MIB, &mut runs).await;
+        for _ in 0..SMALL_DOCUMENTS / 2 {
+            round.extend(measure(&client, pid, WARM_UP_MIB, &mut runs).await);
+        }
+        small.extend_from_slice(&round);
+        large.extend_from_slice(&big);
+        round.extend(big);
+        rounds.push(median(&round));
+    }
+    let (small, large) = (median(&small), median(&large));
+
+    let report = format!(
+        "idle {} MiB; {}; median {} MiB over {} x {WARM_UP_MIB} MiB, \
+         {} MiB over {ROUNDS} x {LARGE_MIB} MiB; by round {:?} MiB",
+        idle / 1024 / 1024,
+        runs.join("; "),
+        small / 1024 / 1024,
+        ROUNDS * SMALL_DOCUMENTS,
+        large / 1024 / 1024,
+        rounds
+            .iter()
+            .map(|rss| rss / 1024 / 1024)
+            .collect::<Vec<_>>(),
+    );
     println!("  {report}");
-    let growth = large.saturating_sub(settled);
+    let growth = large.saturating_sub(small);
     assert!(
         growth < ALLOWED_GROWTH_BYTES,
-        "peak RSS grew by {} MiB while the document grew by {} MiB, which is what \
-         retaining the document would look like: {report}",
+        "median RSS was {} MiB higher while {LARGE_MIB} MiB documents streamed than \
+         while the same bytes streamed as {WARM_UP_MIB} MiB ones, which is what retaining \
+         the document would look like: {report}",
         growth / 1024 / 1024,
-        LARGE_MIB - WARM_UP_MIB,
+    );
+
+    // The interleaving puts small and large documents through each round
+    // alike, so something held from one call to the next would raise both
+    // sides together and pass the comparison above. It shows instead as each
+    // round sitting higher than the one before.
+    let climb = rounds.last().unwrap().saturating_sub(rounds[0]);
+    assert!(
+        climb < ALLOWED_CLIMB_BYTES,
+        "median RSS climbed {} MiB from the first round of identical documents to the \
+         last, which is what holding something between calls would look like: {report}",
+        climb / 1024 / 1024,
     );
 }
