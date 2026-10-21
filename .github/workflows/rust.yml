@@ -25,6 +25,8 @@ jobs:
       run: |
         apt-get update
         apt-get install -y --no-install-recommends ca-certificates curl git nodejs
+        # The workspace mount belongs to the runner user, not root.
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
     - uses: actions/checkout@v4
     - name: Install Rust toolchain
       if: ${{ matrix.toolchain != 'stable' }}
@@ -66,6 +68,8 @@ jobs:
       run: |
         apt-get update
         apt-get install -y --no-install-recommends ca-certificates curl git nodejs
+        # The workspace mount belongs to the runner user, not root.
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
     # Full history: `buf breaking` compares against origin/master.
     - uses: actions/checkout@v4
       with:
