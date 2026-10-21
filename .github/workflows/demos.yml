@@ -8,14 +8,23 @@ on: [ push, pull_request ]
 
 jobs:
   java:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
+    # Docker Hardened Images Temurin 21 JDK. dhi.io signs in with the Docker
+    # Hub org credentials.
+    container:
+      image: dhi.io/eclipse-temurin:21-jdk-dev
+      credentials:
+        username: ${{ secrets.DOCKER_USER }}
+        password: ${{ secrets.DOCKER_TOKEN }}
     steps:
+    # The hardened image ships the JDK only. actions/checkout needs git and node.
+    - name: Install job tooling
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends ca-certificates git nodejs
     - uses: actions/checkout@v4
-    - name: Install a JDK
-      uses: actions/setup-java@v4
-      with:
-        distribution: temurin
-        java-version: '21'
+    - name: JDK version
+      run: java -version
     # The wrapper checks the Gradle distribution against the checksum pinned
     # in gradle-wrapper.properties before it runs anything.
     - name: Build and test the Java client
