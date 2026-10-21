@@ -4,7 +4,7 @@ on: [ push, pull_request ]
 
 jobs:
   rust:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       matrix:
         toolchain:
@@ -43,7 +43,7 @@ jobs:
         cargo clippy --all-targets --all-features -- -Dwarnings
 
   proto:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
     # Full history: `buf breaking` compares against origin/master.
     - uses: actions/checkout@v4
