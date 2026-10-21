@@ -1,9 +1,11 @@
 name: Publish Images
 
 # Builds the service and viewer images and pushes them to
-# docker.io/pipestreamai. Every push to master republishes :latest; a manual
-# dispatch with a version input also tags that version. Docker Hub
-# credentials come from the DOCKER_USER / DOCKER_TOKEN org secrets.
+# docker.io/pipestreamai. Every push to master republishes :latest.
+# A push of a v<version> tag (the fleet release, cut on master) publishes
+# :<version> beside :latest; so does a manual dispatch with a version
+# input. Docker Hub credentials come from the DOCKER_USER / DOCKER_TOKEN
+# org secrets.
 #
 # Multi-arch (amd64 + arm64): the runtime base (dhi.io/debian-base) and the
 # viewer base (dhi.io/node) are both published for the two platforms, and
@@ -11,6 +13,7 @@ name: Publish Images
 on:
   push:
     branches: [master]
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       version:
@@ -39,17 +42,33 @@ jobs:
       # code in a job holding the Docker Hub token. It is then held to a
       # semantic version that is also a valid image tag (no `+` build
       # metadata) before it goes anywhere near a tag list.
+      - name: Resolve the version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/tags/v*) version="${GITHUB_REF_NAME#v}" ;;
+            *) version="${INPUT_VERSION:-}" ;;
+          esac
+          if [ -n "$version" ] && ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]{0,63})?$ ]]; then
+            echo "::error::version '$version' is not a semantic version such as 0.3.0"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Compute tags
         id: tags
         shell: bash
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           svc="docker.io/pipestreamai/grpc-lol-html:latest"
           ui="docker.io/pipestreamai/grpc-lol-html-ui:latest"
           if [ -n "$VERSION" ]; then
             if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]{0,63})?$ ]]; then
-              echo "::error::inputs.version must be a semantic version such as 0.1.0 or 1.2.3-rc.1"
+              echo "::error::the version must be a semantic version such as 0.1.0 or 1.2.3-rc.1"
               exit 1
             fi
             svc="$svc,docker.io/pipestreamai/grpc-lol-html:$VERSION"
