@@ -1423,6 +1423,42 @@ async fn an_oversized_chunk_is_refused_by_the_server_not_the_transport() {
     );
 }
 
+/// A selector that chains thousands of combinators is refused up front, and
+/// the server stays up to serve the next caller.
+///
+/// lol-html compiles a selector by recursing once per combinator, so a few
+/// kilobytes of `a a a ...`, under the byte cap, used to recurse deep enough
+/// to overflow the parse thread's stack and abort the whole process, taking
+/// every other stream with it. The guard turns it into an `InvalidArgument`
+/// on the offending call alone.
+#[tokio::test]
+async fn a_selector_with_thousands_of_combinators_cannot_crash_the_server() {
+    let client = start_server().await;
+
+    let hostile = "a ".repeat(2000);
+    assert!(hostile.len() < 4096, "the attack fits under the byte cap");
+    let options = pb::ExtractOptions {
+        rules: vec![rule("deep", hostile.trim())],
+        ..Default::default()
+    };
+    let err = extract(&client, b"<a><a></a></a>", options, usize::MAX)
+        .await
+        .expect_err("a selector this deep should be refused, not compiled");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+
+    // The process is still answering: a normal request on the same server
+    // succeeds, which it could not if the hostile call had aborted it.
+    let events = extract(&client, b"<a>hi</a>", everything(), usize::MAX)
+        .await
+        .expect("the server survives and serves the next caller");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.event, Some(pb::extract_response::Event::Element(_)))),
+        "the follow-up request should still match elements"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Compression
 // ---------------------------------------------------------------------------
