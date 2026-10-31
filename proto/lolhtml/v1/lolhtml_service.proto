@@ -110,7 +110,7 @@ message ExtractOptions {
   // rule count multiplies both the work and the output.
   repeated ExtractRule rules = 1;
 
-  // Content outside every element, which no selector can reach. Optional.
+  // Document-wide captures. Text includes content inside matched elements. Optional.
   DocumentRule document_rule = 2;
 
   // Character encoding of the document, as a label such as `utf-8` or
@@ -271,12 +271,20 @@ message ElementMatched {
   // Byte range of the start tag. Absent unless CAPTURE_SOURCE_LOCATION was
   // requested.
   optional SourceSpan span = 8;
+
+  // One-based position among this submitted rule's matches, in input order.
+  // Pairs this instance with its content and end-tag events.
+  uint64 match_ordinal = 9;
+
+  // Number of this rule's matches already open before this instance opens.
+  // Zero identifies a top-level match; one identifies a directly nested match.
+  uint32 open_matches = 10;
 }
 
 // TextNode is text content.
 message TextNode {
   // The rule whose element contains this text, or the DocumentRule id for
-  // text outside every element.
+  // every text node in the document, including text inside matched elements.
   string rule_id = 1;
 
   // The text. Entity decoded only for DATA and RCDATA (see TextType), and
@@ -297,6 +305,13 @@ message TextNode {
   // the node. Meaningful only when `raw_text_chunks` was set, where it marks
   // the boundary you would reassemble on.
   bool last_in_node = 5;
+
+  // Innermost open match of this rule containing the text. Zero for document scope.
+  uint64 match_ordinal = 6;
+
+  // On document-scope events, true when at least one text-capturing element
+  // rule is also reporting this node. False on element-rule events.
+  bool also_reported_by_rule = 7;
 }
 
 // CommentFound is an HTML comment.
@@ -311,6 +326,9 @@ message CommentFound {
   // Byte range including the delimiters. Absent unless
   // CAPTURE_SOURCE_LOCATION was requested.
   optional SourceSpan span = 3;
+
+  // Innermost open match of this rule containing the comment. Zero for document scope.
+  uint64 match_ordinal = 4;
 }
 
 // DoctypeFound is the document type declaration.
@@ -361,6 +379,10 @@ message EndTagFound {
 
   // Byte range. Absent unless CAPTURE_SOURCE_LOCATION was requested.
   optional SourceSpan span = 4;
+
+  // The matched instance closed by this tag. The tag name may differ from
+  // that instance's name when a parent's end tag implicitly closes a child.
+  uint64 match_ordinal = 5;
 }
 
 // ExtractFinished closes every successful response stream.
