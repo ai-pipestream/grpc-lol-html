@@ -117,23 +117,23 @@ message Attribute {
 
   // Byte range of the attribute name in the input.
   //
-  // This and `value_span` are present or absent together, because lol-html
-  // records one position for the pair. Both are absent when source locations
-  // were not requested.
-  //
-  // Both are also always absent for a **bare** attribute, one written with no
-  // `=value` at all, such as the `defer` in `<script defer>`. lol-html
-  // reports a position for those that is not a position: it varies with how
-  // the document was chunked and can point at bytes belonging to a different
-  // part of the tag. The server drops the pair rather than pass that on. An
-  // explicitly empty value, `foo=""`, is a real location and keeps its spans.
+  // Absent when source locations were not requested. A bare attribute such
+  // as `defer` in `<script defer>` has a name span but no value span. This
+  // distinction preserves the original syntax: `foo=""` has both spans,
+  // with an empty value range. Locations are independent of upload chunking.
   optional SourceSpan name_span = 4;
 
   // Byte range of the attribute value in the input, covering the value itself
   // and not the surrounding quotes or the `=`.
   //
-  // See `name_span` for when this is absent.
+  // Absent when source locations were not requested, or for a bare attribute
+  // written without `=value`. An explicitly empty value keeps an empty span.
   optional SourceSpan value_span = 5;
+
+  // Whether the original attribute used an equals sign and value, including
+  // an explicitly empty value. False identifies a bare attribute. Absent
+  // only when source syntax is unavailable; independent of span capture.
+  optional bool value_present = 6;
 }
 
 // MemoryLimits caps what a single Extract call may allocate.
@@ -144,7 +144,7 @@ message Attribute {
 // HTML needs this set.
 message MemoryLimits {
   // Hard cap in bytes on the parser's buffered state, and separately on the
-  // text the server holds while reassembling text nodes, summed across rules
+  // text reassembly and open-match stack capacity, summed across rules
   // (see `raw_text_chunks`). Zero means the server's own default rather than
   // "unlimited"; a server accepting arbitrary input should never run
   // unlimited.
@@ -252,11 +252,11 @@ message ExtractRule {
   repeated Capture captures = 3;
 }
 
-// DocumentRule captures content that lies outside every element, and which no
-// CSS selector can therefore reach.
+// DocumentRule captures document-wide content without a CSS selector.
 //
-// Mirrors `lol_html::DocumentContentHandlers`. The doctype, and any comment
-// before `<html>` or after `</html>`, are only reachable this way.
+// Mirrors `lol_html::DocumentContentHandlers`. The doctype and comments
+// outside elements are only reachable this way. Text includes every node,
+// including nodes also reported by selector rules.
 message DocumentRule {
   // Identifier echoed as `rule_id` on events this rule produces. Defaults to
   // `"document"` when empty.
@@ -268,7 +268,7 @@ message DocumentRule {
   // Report document-level comments as `comment` events.
   bool comments = 3;
 
-  // Report document-level text as `text` events, subject to the call's
+  // Report every text node, including text inside elements, subject to the call's
   // `text_types` filter.
   bool text = 4;
 }

@@ -37,8 +37,8 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -451,6 +451,7 @@ async fn drive(
     let sink = Sink {
         outbound: outbound.clone(),
         send_timeout: limits.send_timeout,
+        active_text_matches: Arc::new(AtomicUsize::new(0)),
         text: Arc::new(TextBudget {
             held: AtomicUsize::new(0),
             limit: compiled.max_memory_bytes,
@@ -683,7 +684,7 @@ fn stopped_by_client(
             outbound.abort(not_reading(limits.send_timeout));
             Some(Ending::NotReading)
         }
-        HandlerStop::TextOverLimit { .. } => None,
+        HandlerStop::TextOverLimit { .. } | HandlerStop::MatchStateOverLimit { .. } => None,
     }
 }
 
@@ -806,6 +807,7 @@ struct Sink {
     outbound: Outbound,
     send_timeout: Duration,
     text: Arc<TextBudget>,
+    active_text_matches: Arc<AtomicUsize>,
 }
 
 impl Sink {
@@ -827,7 +829,7 @@ impl Sink {
     }
 }
 
-/// Text held for reassembly across one call's handlers, counted against the
+/// Text reassembly and match-stack storage across one call's handlers, counted against the
 /// call's memory limit.
 ///
 /// lol-html's own limit cannot see this text. lol-html streams text out in
@@ -888,17 +890,45 @@ fn element_handlers(
     compiled: &CompiledOptions,
 ) -> ElementContentHandlers<'static> {
     let mut handlers = ElementContentHandlers::default();
+    let matches = Arc::new(Mutex::new(Vec::<u64>::new()));
 
     {
         let (id, sink) = (rule.id.clone(), sink.clone());
+        let matches = Arc::clone(&matches);
+        let captures_text = rule.text;
         let (want_tag, want_attrs, want_spans, want_end) =
             (rule.tag_name, rule.attributes, rule.spans, rule.end_tag);
 
         handlers = handlers.element(move |el: &mut lol_html::send::Element<'_, '_>| {
-            counter.fetch_add(1, Ordering::Relaxed);
+            let ordinal = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let open_matches = matches.lock().expect("match stack lock").len() as u32;
+            if el.can_have_content() {
+                let mut stack = matches.lock().expect("match stack lock");
+                if stack.len() == stack.capacity() {
+                    // Account for allocated capacity, not only live ordinals:
+                    // popped entries retain storage for later matches.
+                    let capacity = stack.capacity().max(1) * 2;
+                    let growth = (capacity - stack.capacity()) * std::mem::size_of::<u64>();
+                    if !sink.text.hold(growth) {
+                        return Err(HandlerStop::MatchStateOverLimit {
+                            limit_bytes: sink.text.limit,
+                        }
+                        .into());
+                    }
+                    let additional = capacity - stack.len();
+                    stack.reserve_exact(additional);
+                }
+                stack.push(ordinal);
+                drop(stack);
+                if captures_text {
+                    sink.active_text_matches.fetch_add(1, Ordering::Relaxed);
+                }
+            }
 
             let event = pb::ElementMatched {
                 rule_id: id.clone(),
+                match_ordinal: ordinal,
+                open_matches,
                 tag_name: if want_tag {
                     el.tag_name()
                 } else {
@@ -924,24 +954,34 @@ fn element_handlers(
             };
             sink.emit(pb::extract_response::Event::Element(event))?;
 
-            if want_end {
+            if el.can_have_content() {
                 let (id, sink) = (id.clone(), sink.clone());
-                // Fires only if the element actually closes. A void element,
-                // a self-closing tag, and an element the document never
-                // closes all produce nothing here, which is why the contract
-                // says this is not a dependable "element finished" signal.
+                let matches = Arc::clone(&matches);
+                // Always track closes, even when end tags are not captured.
+                // The lexical tag can be a parent's implicit close.
                 let registered = el.on_end_tag(Box::new(move |end: &mut EndTag<'_>| {
-                    sink.emit(pb::extract_response::Event::EndTag(pb::EndTagFound {
-                        rule_id: id,
-                        name: end.name(),
-                        name_raw: end.name_preserve_case(),
-                        span: want_spans.then(|| convert::source_span(&end.source_location())),
-                    }))
+                    let removed = {
+                        let mut stack = matches.lock().expect("match stack lock");
+                        stack
+                            .iter()
+                            .rposition(|value| *value == ordinal)
+                            .map(|index| stack.remove(index))
+                    };
+                    if removed.is_some() && captures_text {
+                        sink.active_text_matches.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    if want_end {
+                        sink.emit(pb::extract_response::Event::EndTag(pb::EndTagFound {
+                            rule_id: id,
+                            name: end.name(),
+                            name_raw: end.name_preserve_case(),
+                            span: want_spans.then(|| convert::source_span(&end.source_location())),
+                            match_ordinal: ordinal,
+                        }))?;
+                    }
+                    Ok(())
                 }));
-                // `on_end_tag` refuses on an element that cannot have one.
-                // That is information, not a failure: there is simply no end
-                // tag to report.
-                let _ = registered;
+                debug_assert!(registered.is_ok());
             }
 
             Ok(())
@@ -953,15 +993,23 @@ fn element_handlers(
             rule.id.clone(),
             sink.clone(),
             rule.spans,
+            Some(Arc::clone(&matches)),
             compiled,
         ));
     }
 
     if rule.comments {
         let (id, sink, want_spans) = (rule.id.clone(), sink.clone(), rule.spans);
+        let matches = Arc::clone(&matches);
         handlers = handlers.comments(move |comment: &mut Comment<'_>| {
             sink.emit(pb::extract_response::Event::Comment(pb::CommentFound {
                 rule_id: id.clone(),
+                match_ordinal: matches
+                    .lock()
+                    .expect("match stack lock")
+                    .last()
+                    .copied()
+                    .unwrap_or(0),
                 text: comment.text(),
                 span: want_spans.then(|| convert::source_span(&comment.source_location())),
             }))
@@ -997,6 +1045,7 @@ fn document_handlers(
         handlers = handlers.comments(move |comment: &mut Comment<'_>| {
             sink.emit(pb::extract_response::Event::Comment(pb::CommentFound {
                 rule_id: id.clone(),
+                match_ordinal: 0,
                 text: comment.text(),
                 span: want_spans.then(|| convert::source_span(&comment.source_location())),
             }))
@@ -1008,6 +1057,7 @@ fn document_handlers(
             scope.id.clone(),
             sink.clone(),
             scope.spans,
+            None,
             compiled,
         ));
     }
@@ -1032,6 +1082,7 @@ fn text_handler(
     rule_id: String,
     sink: Sink,
     want_spans: bool,
+    matches: Option<Arc<Mutex<Vec<u64>>>>,
     compiled: &CompiledOptions,
 ) -> impl FnMut(&mut TextChunk<'_>) -> lol_html::HandlerResult + Send + 'static {
     let raw = compiled.raw_text_chunks;
@@ -1043,6 +1094,12 @@ fn text_handler(
     move |chunk: &mut TextChunk<'_>| {
         let text_type = convert::text_type(chunk.text_type());
         let last = chunk.last_in_text_node();
+        let match_ordinal = matches
+            .as_ref()
+            .and_then(|stack| stack.lock().expect("match stack lock").last().copied())
+            .unwrap_or(0);
+        let also_reported_by_rule =
+            matches.is_none() && sink.active_text_matches.load(Ordering::Relaxed) > 0;
 
         if !allowed.contains(&text_type) {
             // Reset even for text we are dropping: a filtered node must not
@@ -1066,6 +1123,8 @@ fn text_handler(
                 text_type: text_type as i32,
                 span: want_spans.then(|| convert::source_span(&chunk.source_location())),
                 last_in_node: last,
+                match_ordinal,
+                also_reported_by_rule,
             }));
         }
 
@@ -1115,6 +1174,8 @@ fn text_handler(
                     text_type: text_type as i32,
                     span: span.map(|(start, end)| pb::SourceSpan { start, end }),
                     last_in_node: true,
+                    match_ordinal,
+                    also_reported_by_rule,
                 }))?;
             }
             span = None;

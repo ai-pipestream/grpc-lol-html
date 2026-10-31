@@ -819,12 +819,26 @@ async fn attributes_keep_their_case_their_bare_forms_and_their_spans() {
         "the value span covers the value itself, not the surrounding quotes"
     );
 
-    // A bare attribute carries neither span: lol-html records one position
-    // for the name/value pair, and a bare attribute is not one.
-    let defer = &script.attributes[1];
-    assert_eq!(defer.name, "defer");
-    assert!(defer.name_span.is_none());
-    assert!(defer.value_span.is_none());
+    // Bare attributes preserve their name location, but have no value span.
+    for chunk_size in [1, 8, 64, usize::MAX] {
+        let events = extract_file(&client, file, everything(), chunk_size).await;
+        let script = only!(events, Event::Element)
+            .into_iter()
+            .find(|el| el.tag_name == "script")
+            .expect("the script element");
+        for (attr, written) in script.attributes[1..].iter().zip(["DEFER", "async"]) {
+            let name = attr.name_span.as_ref().expect("bare attribute name span");
+            assert_eq!(
+                &source[name.start as usize..name.end as usize],
+                written,
+                "name span at chunk size {chunk_size}"
+            );
+            assert!(
+                attr.value_span.is_none(),
+                "bare attributes have no value span"
+            );
+        }
+    }
 }
 
 /// End tags are reported for elements that close, and not for those that
@@ -1420,6 +1434,44 @@ async fn an_oversized_chunk_is_refused_by_the_server_not_the_transport() {
         err.message().contains("exceeds") && err.message().contains("smaller chunks"),
         "the error should say what to do: {}",
         err.message()
+    );
+}
+
+/// A selector that chains thousands of combinators is refused up front, and
+/// the server stays up to serve the next caller.
+///
+/// lol-html compiles a selector by recursing once per combinator, so a few
+/// kilobytes of `a a a ...`, under the byte cap, used to recurse deep enough
+/// to overflow the parse thread's stack and abort the whole process, taking
+/// every other stream with it. The guard turns it into an `InvalidArgument`
+/// on the offending call alone.
+#[tokio::test]
+async fn a_selector_with_thousands_of_combinators_cannot_crash_the_server() {
+    let client = start_server().await;
+
+    for separator in [" ", "\x0c"] {
+        let hostile = format!("a{separator}").repeat(2000);
+        assert!(hostile.len() < 4096, "the attack fits under the byte cap");
+        let options = pb::ExtractOptions {
+            rules: vec![rule("deep", hostile.trim())],
+            ..Default::default()
+        };
+        let err = extract(&client, b"<a><a></a></a>", options, usize::MAX)
+            .await
+            .expect_err("a selector this deep should be refused, not compiled");
+        assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    }
+
+    // The process is still answering: a normal request on the same server
+    // succeeds, which it could not if the hostile call had aborted it.
+    let events = extract(&client, b"<a>hi</a>", everything(), usize::MAX)
+        .await
+        .expect("the server survives and serves the next caller");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.event, Some(pb::extract_response::Event::Element(_)))),
+        "the follow-up request should still match elements"
     );
 }
 
@@ -2554,4 +2606,300 @@ async fn text_held_for_reassembly_is_counted_across_rules() {
         errors[0].code,
         pb::ParseErrorCode::MemoryLimitExceeded as i32
     );
+}
+
+/// Nested matches retain identity across implicit and explicit closes.
+#[tokio::test]
+async fn matched_instances_pair_content_and_closing_tags() {
+    let client = start_server().await;
+    let options = pb::ExtractOptions {
+        rules: vec![rule("cards", "div.card")],
+        ..Default::default()
+    };
+    let bytes = b"<div class=card><p>outer</p><div class=card><p>inner</p><!--inside--></div><p>after</p></div>";
+    for size in [1, 7, usize::MAX] {
+        let events = extract(&client, bytes, options.clone(), size)
+            .await
+            .unwrap();
+        let elements = only!(events, Event::Element);
+        assert_eq!(
+            elements
+                .iter()
+                .map(|e| (e.match_ordinal, e.open_matches))
+                .collect::<Vec<_>>(),
+            [(1, 0), (2, 1)]
+        );
+        assert_eq!(
+            only!(events, Event::Text)
+                .iter()
+                .map(|e| (e.text.as_str(), e.match_ordinal))
+                .collect::<Vec<_>>(),
+            [("outer", 1), ("inner", 2), ("after", 1)]
+        );
+        assert_eq!(only!(events, Event::Comment)[0].match_ordinal, 2);
+        assert_eq!(
+            only!(events, Event::EndTag)
+                .iter()
+                .map(|e| e.match_ordinal)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+    }
+
+    let events = extract(
+        &client,
+        b"<div id=open><span>x</div>",
+        pb::ExtractOptions {
+            rules: vec![rule("all", "div, span")],
+            ..Default::default()
+        },
+        1,
+    )
+    .await
+    .unwrap();
+    let ends = only!(events, Event::EndTag);
+    assert!(
+        ends.iter().any(|e| e.name == "div" && e.match_ordinal == 2),
+        "parent tag closes child instance"
+    );
+    let events = extract(
+        &client,
+        b"<span>x",
+        pb::ExtractOptions {
+            rules: vec![rule("span", "span")],
+            ..Default::default()
+        },
+        1,
+    )
+    .await
+    .unwrap();
+    assert!(only!(events, Event::EndTag).is_empty());
+    assert_eq!(only!(events, Event::Text)[0].match_ordinal, 1);
+
+    let events = extract(
+        &client,
+        b"<title>T</title><h1>H</h1>",
+        pb::ExtractOptions {
+            rules: vec![rule("headings", "title, h1")],
+            ..Default::default()
+        },
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        only!(events, Event::Text)
+            .iter()
+            .map(|e| (e.text.as_str(), e.match_ordinal))
+            .collect::<Vec<_>>(),
+        [("T", 1), ("H", 2)]
+    );
+}
+
+/// Tracking does not depend on asking for end-tag capture, and document text
+/// explicitly identifies nodes also reported by a text-capturing rule.
+#[tokio::test]
+async fn document_text_marks_duplicates_and_text_only_rules_close_internally() {
+    let client = start_server().await;
+    let options = pb::ExtractOptions {
+        rules: vec![pb::ExtractRule {
+            id: "p".into(),
+            selector: "p".into(),
+            captures: vec![pb::Capture::Text as i32],
+        }],
+        document_rule: Some(pb::DocumentRule {
+            id: "doc".into(),
+            text: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let events = extract(&client, b"<p>a</p>b<p>c</p>d", options, 1)
+        .await
+        .unwrap();
+    let texts = only!(events, Event::Text);
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|e| e.rule_id == "doc")
+            .map(|e| (e.text.as_str(), e.match_ordinal, e.also_reported_by_rule))
+            .collect::<Vec<_>>(),
+        [
+            ("a", 0, true),
+            ("b", 0, false),
+            ("c", 0, true),
+            ("d", 0, false)
+        ]
+    );
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|e| e.rule_id == "p")
+            .map(|e| (e.text.as_str(), e.match_ordinal, e.also_reported_by_rule))
+            .collect::<Vec<_>>(),
+        [("a", 1, false), ("c", 2, false)]
+    );
+    assert_eq!(
+        only!(events, Event::Element)
+            .iter()
+            .map(|e| (e.match_ordinal, e.open_matches))
+            .collect::<Vec<_>>(),
+        [(1, 0), (2, 0)]
+    );
+    assert!(only!(events, Event::EndTag).is_empty());
+}
+
+/// Bare and explicitly empty attributes remain distinct without span capture.
+#[tokio::test]
+async fn attribute_value_presence_does_not_require_source_capture() {
+    let client = start_server().await;
+    let options = pb::ExtractOptions {
+        rules: vec![pb::ExtractRule {
+            id: "p".into(),
+            selector: "p".into(),
+            captures: vec![pb::Capture::Attributes as i32],
+        }],
+        ..Default::default()
+    };
+    let events = extract(&client, b"<p bare empty=\"\" other='x'>", options, 1)
+        .await
+        .unwrap();
+    let elements = only!(events, Event::Element);
+    assert_eq!(
+        elements[0]
+            .attributes
+            .iter()
+            .map(|a| a.value_present)
+            .collect::<Vec<_>>(),
+        [Some(false), Some(true), Some(true)]
+    );
+    assert!(
+        elements[0]
+            .attributes
+            .iter()
+            .all(|a| a.name_span.is_none() && a.value_span.is_none())
+    );
+}
+
+#[path = "support/corpus.rs"]
+mod hazard_corpus;
+
+/// Seeded irregular boundaries include tiny fragments and large chunks, so
+/// alignment cannot hide parser, instance-tracking or span regressions.
+#[tokio::test]
+async fn random_split_points_do_not_change_the_stream() {
+    let client = start_server().await;
+    let bytes = hazard_corpus::hazard_document();
+    let options = pb::ExtractOptions {
+        text_types: (1..=6).collect(),
+        ..everything()
+    };
+    let baseline = extract(&client, &bytes, options.clone(), usize::MAX)
+        .await
+        .unwrap();
+    for seed in 1..=8 {
+        let events = extract_random_splits(&client, &bytes, options.clone(), seed).await;
+        assert_eq!(
+            baseline.len(),
+            events.len(),
+            "event count for split seed {seed}"
+        );
+        for (index, (expected, actual)) in baseline.iter().zip(&events).enumerate() {
+            assert_eq!(
+                expected, actual,
+                "first differing event {index}; split seed {seed}"
+            );
+        }
+    }
+    let raw = extract_random_splits(
+        &client,
+        &bytes,
+        pb::ExtractOptions {
+            raw_text_chunks: true,
+            ..options
+        },
+        17,
+    )
+    .await;
+    // Raw fragments are verbatim; decode only after the whole node is joined.
+    let mut buffers =
+        std::collections::HashMap::<(String, u64), (String, Option<pb::SourceSpan>)>::new();
+    let mut nodes = Vec::new();
+    for event in raw {
+        let Some(Event::Text(mut text)) = event.event else {
+            continue;
+        };
+        let key = (text.rule_id.clone(), text.match_ordinal);
+        let buffer = buffers.entry(key.clone()).or_default();
+        buffer.0.push_str(&text.text);
+        if let Some(span) = &text.span {
+            match &mut buffer.1 {
+                Some(total) => total.end = span.end,
+                None => buffer.1 = Some(*span),
+            }
+        }
+        if text.last_in_node {
+            let (joined, span) = buffers.remove(&key).unwrap();
+            if joined.is_empty() {
+                continue;
+            }
+            text.text = if [pb::TextType::Data as i32, pb::TextType::Rcdata as i32]
+                .contains(&text.text_type)
+            {
+                htmlize::unescape(joined.as_str()).into_owned()
+            } else {
+                joined
+            };
+            text.span = span;
+            nodes.push(text);
+        }
+    }
+    assert!(buffers.is_empty(), "all raw nodes terminated; seed17");
+    let expected: Vec<_> = baseline
+        .into_iter()
+        .filter_map(|event| match event.event {
+            Some(Event::Text(text)) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(expected, nodes, "raw reassembly seed17");
+}
+
+async fn extract_random_splits(
+    client: &LolHtmlServiceClient<Channel>,
+    bytes: &[u8],
+    options: pb::ExtractOptions,
+    seed: u64,
+) -> Vec<pb::ExtractResponse> {
+    let mut state = seed;
+    let mut frames = vec![pb::ExtractRequest {
+        frame: Some(pb::extract_request::Frame::Options(options)),
+    }];
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let random = hazard_corpus::next_random(&mut state);
+        let length = if random & 1 == 0 {
+            1 + random as usize % 16
+        } else {
+            1 + random as usize % (64 * 1024)
+        };
+        let end = (offset + length).min(bytes.len());
+        frames.push(pb::ExtractRequest {
+            frame: Some(pb::extract_request::Frame::Chunk(
+                bytes[offset..end].to_vec(),
+            )),
+        });
+        offset = end;
+    }
+    let mut client = client.clone();
+    let mut stream = client
+        .extract(tokio_stream::iter(frames))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut events = Vec::new();
+    while let Some(event) = stream.message().await.unwrap() {
+        events.push(event);
+    }
+    events
 }

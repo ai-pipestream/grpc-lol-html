@@ -45,6 +45,18 @@ pub const MAX_RULE_ID_BYTES: usize = 256;
 /// Longest selector accepted, in bytes. Real selectors are a few dozen.
 pub const MAX_SELECTOR_BYTES: usize = 4096;
 
+/// Most combinators one selector may chain.
+///
+/// lol-html turns a selector into a program and compiles it by recursing once
+/// for every descendant, child or sibling combinator between compound pieces.
+/// A selector that chains hundreds of them nests the compiler deep enough to
+/// overflow the stack and abort the process, and the byte cap alone does not
+/// stop it: a few kilobytes of `a a a ...` stays under [`MAX_SELECTOR_BYTES`]
+/// yet recurses far past the stack. Real selectors chain a handful, so this
+/// sits well above anything a caller writes and well below where the parse
+/// starts to run out of stack.
+pub const MAX_SELECTOR_COMBINATORS: usize = 64;
+
 /// What lol-html preallocates for its parsing buffer when told nothing.
 const LOL_HTML_PREALLOCATED_BYTES: usize = 1024;
 
@@ -261,9 +273,60 @@ pub fn check_rule_set(rules: &[pb::ExtractRule]) -> Result<(), Status> {
                 rule.selector.len()
             )));
         }
+        let combinators = selector_combinators(&rule.selector);
+        if combinators > MAX_SELECTOR_COMBINATORS {
+            return Err(Status::invalid_argument(format!(
+                "rule `{}` chains {combinators} combinators; a selector may chain at most \
+                 {MAX_SELECTOR_COMBINATORS}. Deeper chains recurse the parser far enough to \
+                 exhaust its stack.",
+                rule.id
+            )));
+        }
     }
 
     Ok(())
+}
+
+/// Count the combinators the deepest selector in a list chains together.
+///
+/// Each descendant (whitespace), child (`>`) or sibling (`+`, `~`) combinator
+/// between compound pieces adds one level to lol-html's recursive compile, so
+/// this is the depth that must be bounded. Combinators inside attribute
+/// selectors, functional pseudo-classes, or strings are structurally inert and
+/// are skipped, and a comma starts a fresh selector whose depth is independent,
+/// so the maximum across the list is what counts.
+fn selector_combinators(selector: &str) -> usize {
+    let mut deepest = 0usize;
+    let mut pieces = 0usize; // compound pieces seen in the current selector
+    let mut nesting = 0u32; // inside `[` ... `]` or `(` ... `)`
+    let mut quote: Option<u8> = None;
+    let mut in_piece = false; // currently inside a compound piece
+    for &byte in selector.as_bytes() {
+        if let Some(delimiter) = quote {
+            if byte == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' => quote = Some(byte),
+            b'[' | b'(' => nesting += 1,
+            b']' | b')' => nesting = nesting.saturating_sub(1),
+            _ if nesting > 0 => {}
+            b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'>' | b'+' | b'~' => in_piece = false,
+            b',' => {
+                deepest = deepest.max(pieces.saturating_sub(1));
+                pieces = 0;
+                in_piece = false;
+            }
+            _ if !in_piece => {
+                pieces += 1;
+                in_piece = true;
+            }
+            _ => {}
+        }
+    }
+    deepest.max(pieces.saturating_sub(1))
 }
 
 /// Compile one rule, mapping its captures onto flags.
@@ -680,6 +743,34 @@ mod tests {
             "{}",
             err.message()
         );
+    }
+
+    #[test]
+    fn a_selector_that_chains_too_many_combinators_is_refused() {
+        // Under the byte cap, over the combinator cap: a few thousand bytes of
+        // descendant combinators, which recurses lol-html's compile deep
+        // enough to overflow the stack if it ever reaches the parser.
+        let deep = "a ".repeat(MAX_SELECTOR_COMBINATORS + 2);
+        assert!(deep.len() <= MAX_SELECTOR_BYTES, "stays under the byte cap");
+        let options = pb::ExtractOptions {
+            rules: vec![rule("r", deep.trim())],
+            ..Default::default()
+        };
+        let err = rejection(&options);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("combinators"), "{}", err.message());
+
+        // A comma starts a fresh selector, so a long list of shallow selectors
+        // is accepted: its depth is the deepest piece, not the total.
+        let list = (0..MAX_RULES)
+            .map(|_| "a > b")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let shallow = pb::ExtractOptions {
+            rules: vec![rule("r", &list)],
+            ..Default::default()
+        };
+        assert_eq!(compiled(&shallow, CEILING).rules.len(), 1);
     }
 
     #[test]

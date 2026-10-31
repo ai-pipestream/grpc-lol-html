@@ -180,6 +180,23 @@ larger than the limit ends the run with `MEMORY_LIMIT_EXCEEDED` (or a
 `bailed_out` finish, under `graceful_bail_out`) rather than arriving in
 pieces nobody asked for.
 
+Each matched instance has a one-based `match_ordinal` within its submitted
+rule. `open_matches` on its start event counts matches of that rule already
+open. Text and comments name the innermost open match; end tags name the
+instance being closed, even when a parent's tag implicitly closes a child.
+Void elements and elements left unclosed at EOF have no synthetic closing
+event. Use `(rule_id, match_ordinal)` to attach content, and assign unique rule
+ids when instance identity matters. Open-instance tracking shares the text
+memory limit.
+
+`document_rule.text` reports **all** document text, including nodes also
+captured by element rules. Its events have ordinal zero; their
+`also_reported_by_rule` flag identifies duplicates reported by an active
+text-capturing rule. Keep only document events with that flag false to retain
+uncaptured text without indexing captured text twice. Attribute
+`value_present` distinguishes a bare attribute from an explicitly empty value,
+even when byte spans were not requested.
+
 ### 2. It does not run JavaScript
 
 No engine, no DOM, no fetching of `<script src>`. This is a tokenizer, and

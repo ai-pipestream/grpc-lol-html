@@ -56,30 +56,9 @@ pub const fn text_type(text_type: TextType) -> pb::TextType {
 
 /// Convert one attribute, optionally carrying its source spans.
 ///
-/// # Bare attributes, and why the spans are filtered
-///
-/// lol-html 3.0.0 reports unusable source locations for an attribute written
-/// without a value, such as the `defer` in `<script defer>`. It keeps one
-/// position for the name/value pair, and for a bare attribute the value half
-/// is never set, so what comes back is whatever that slot happened to hold.
-/// Reproduced directly against the library, no gRPC involved, on
-/// `<html><body>\n<script SRC="/a.js" DEFER async></script>...`:
-///
-/// ```text
-/// chunk 8:   defer: name=Some(33..38)  value=Some(13..13)
-/// chunk 64:  defer: name=None          value=None
-/// ```
-///
-/// Byte 13 is the start of `<script`, nowhere near the attribute, and which
-/// of the two shapes you get depends on how the caller split the upload.
-/// Handing that to a client would break the one promise this service makes,
-/// that chunking is invisible.
-///
-/// A real value always begins after its own name ends, so a value span
-/// starting before the name ends cannot be a location. Both spans are dropped
-/// for such an attribute, which is deterministic and never wrong. An
-/// explicitly empty value, `foo=""`, still points where it should and keeps
-/// its spans.
+/// lol-html 3.0.3 reports a name location and no value location for bare
+/// attributes. Preserve that distinction rather than discarding the name.
+/// An explicitly empty value has both locations, with an empty value range.
 pub fn attribute(attr: &Attribute<'_>, want_spans: bool) -> pb::Attribute {
     let (name_span, value_span) = if want_spans {
         attribute_spans(attr)
@@ -91,6 +70,9 @@ pub fn attribute(attr: &Attribute<'_>, want_spans: bool) -> pb::Attribute {
         name: attr.name(),
         name_raw: attr.name_preserve_case(),
         value: unescape_attribute_value(attr.value()),
+        value_present: attr
+            .name_source_location()
+            .map(|_| attr.value_source_location().is_some()),
         name_span,
         value_span,
     }

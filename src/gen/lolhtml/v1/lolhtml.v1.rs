@@ -44,24 +44,24 @@ pub struct Attribute {
     pub value: ::prost::alloc::string::String,
     /// Byte range of the attribute name in the input.
     ///
-    /// This and `value_span` are present or absent together, because lol-html
-    /// records one position for the pair. Both are absent when source locations
-    /// were not requested.
-    ///
-    /// Both are also always absent for a **bare** attribute, one written with no
-    /// `=value` at all, such as the `defer` in `<script defer>`. lol-html
-    /// reports a position for those that is not a position: it varies with how
-    /// the document was chunked and can point at bytes belonging to a different
-    /// part of the tag. The server drops the pair rather than pass that on. An
-    /// explicitly empty value, `foo=""`, is a real location and keeps its spans.
+    /// Absent when source locations were not requested. A bare attribute such
+    /// as `defer` in `<script defer>` has a name span but no value span. This
+    /// distinction preserves the original syntax: `foo=""` has both spans,
+    /// with an empty value range. Locations are independent of upload chunking.
     #[prost(message, optional, tag="4")]
     pub name_span: ::core::option::Option<SourceSpan>,
     /// Byte range of the attribute value in the input, covering the value itself
     /// and not the surrounding quotes or the `=`.
     ///
-    /// See `name_span` for when this is absent.
+    /// Absent when source locations were not requested, or for a bare attribute
+    /// written without `=value`. An explicitly empty value keeps an empty span.
     #[prost(message, optional, tag="5")]
     pub value_span: ::core::option::Option<SourceSpan>,
+    /// Whether the original attribute used an equals sign and value, including
+    /// an explicitly empty value. False identifies a bare attribute. Absent
+    /// only when source syntax is unavailable; independent of span capture.
+    #[prost(bool, optional, tag="6")]
+    pub value_present: ::core::option::Option<bool>,
 }
 /// MemoryLimits caps what a single Extract call may allocate.
 ///
@@ -72,7 +72,7 @@ pub struct Attribute {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MemoryLimits {
     /// Hard cap in bytes on the parser's buffered state, and separately on the
-    /// text the server holds while reassembling text nodes, summed across rules
+    /// text reassembly and open-match stack capacity, summed across rules
     /// (see `raw_text_chunks`). Zero means the server's own default rather than
     /// "unlimited"; a server accepting arbitrary input should never run
     /// unlimited.
@@ -145,11 +145,11 @@ pub struct ExtractRule {
     #[prost(enumeration="Capture", repeated, tag="3")]
     pub captures: ::prost::alloc::vec::Vec<i32>,
 }
-/// DocumentRule captures content that lies outside every element, and which no
-/// CSS selector can therefore reach.
+/// DocumentRule captures document-wide content without a CSS selector.
 ///
-/// Mirrors `lol_html::DocumentContentHandlers`. The doctype, and any comment
-/// before `<html>` or after `</html>`, are only reachable this way.
+/// Mirrors `lol_html::DocumentContentHandlers`. The doctype and comments
+/// outside elements are only reachable this way. Text includes every node,
+/// including nodes also reported by selector rules.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DocumentRule {
     /// Identifier echoed as `rule_id` on events this rule produces. Defaults to
@@ -162,7 +162,7 @@ pub struct DocumentRule {
     /// Report document-level comments as `comment` events.
     #[prost(bool, tag="3")]
     pub comments: bool,
-    /// Report document-level text as `text` events, subject to the call's
+    /// Report every text node, including text inside elements, subject to the call's
     /// `text_types` filter.
     #[prost(bool, tag="4")]
     pub text: bool,
@@ -534,7 +534,7 @@ pub struct ExtractOptions {
     /// rule count multiplies both the work and the output.
     #[prost(message, repeated, tag="1")]
     pub rules: ::prost::alloc::vec::Vec<ExtractRule>,
-    /// Content outside every element, which no selector can reach. Optional.
+    /// Document-wide captures. Text includes content inside matched elements. Optional.
     #[prost(message, optional, tag="2")]
     pub document_rule: ::core::option::Option<DocumentRule>,
     /// Character encoding of the document, as a label such as `utf-8` or
@@ -711,12 +711,20 @@ pub struct ElementMatched {
     /// requested.
     #[prost(message, optional, tag="8")]
     pub span: ::core::option::Option<SourceSpan>,
+    /// One-based position among this submitted rule's matches, in input order.
+    /// Pairs this instance with its content and end-tag events.
+    #[prost(uint64, tag="9")]
+    pub match_ordinal: u64,
+    /// Number of this rule's matches already open before this instance opens.
+    /// Zero identifies a top-level match; one identifies a directly nested match.
+    #[prost(uint32, tag="10")]
+    pub open_matches: u32,
 }
 /// TextNode is text content.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TextNode {
     /// The rule whose element contains this text, or the DocumentRule id for
-    /// text outside every element.
+    /// every text node in the document, including text inside matched elements.
     #[prost(string, tag="1")]
     pub rule_id: ::prost::alloc::string::String,
     /// The text. Entity decoded only for DATA and RCDATA (see TextType), and
@@ -738,6 +746,13 @@ pub struct TextNode {
     /// the boundary you would reassemble on.
     #[prost(bool, tag="5")]
     pub last_in_node: bool,
+    /// Innermost open match of this rule containing the text. Zero for document scope.
+    #[prost(uint64, tag="6")]
+    pub match_ordinal: u64,
+    /// On document-scope events, true when at least one text-capturing element
+    /// rule is also reporting this node. False on element-rule events.
+    #[prost(bool, tag="7")]
+    pub also_reported_by_rule: bool,
 }
 /// CommentFound is an HTML comment.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -753,6 +768,9 @@ pub struct CommentFound {
     /// CAPTURE_SOURCE_LOCATION was requested.
     #[prost(message, optional, tag="3")]
     pub span: ::core::option::Option<SourceSpan>,
+    /// Innermost open match of this rule containing the comment. Zero for document scope.
+    #[prost(uint64, tag="4")]
+    pub match_ordinal: u64,
 }
 /// DoctypeFound is the document type declaration.
 ///
@@ -796,6 +814,10 @@ pub struct EndTagFound {
     /// Byte range. Absent unless CAPTURE_SOURCE_LOCATION was requested.
     #[prost(message, optional, tag="4")]
     pub span: ::core::option::Option<SourceSpan>,
+    /// The matched instance closed by this tag. The tag name may differ from
+    /// that instance's name when a parent's end tag implicitly closes a child.
+    #[prost(uint64, tag="5")]
+    pub match_ordinal: u64,
 }
 /// ExtractFinished closes every successful response stream.
 #[derive(Clone, PartialEq, ::prost::Message)]

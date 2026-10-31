@@ -35,6 +35,11 @@ pub enum HandlerStop {
         /// Bytes of events waiting when the server gave up.
         queued_bytes: usize,
     },
+    /// Open-match stack capacity outgrew the call's memory limit.
+    MatchStateOverLimit {
+        /// The shared text and match-state limit, in bytes.
+        limit_bytes: usize,
+    },
     /// Text held for reassembly outgrew the call's memory limit.
     TextOverLimit {
         /// The limit it outgrew, in bytes.
@@ -49,6 +54,10 @@ impl fmt::Display for HandlerStop {
             Self::NotReading { queued_bytes } => write!(
                 f,
                 "the client stopped reading responses with {queued_bytes} bytes of events waiting"
+            ),
+            Self::MatchStateOverLimit { limit_bytes } => write!(
+                f,
+                "open-match tracking outgrew the {limit_bytes} byte memory limit"
             ),
             Self::TextOverLimit { limit_bytes } => write!(
                 f,
@@ -165,5 +174,25 @@ pub fn stream_error(err: &RewritingError) -> pb::StreamError {
 /// strict mode exists to refuse.
 pub fn is_memory_limit(err: &RewritingError) -> bool {
     matches!(err, RewritingError::MemoryLimitExceeded(_))
-        || matches!(handler_stop(err), Some(HandlerStop::TextOverLimit { .. }))
+        || matches!(
+            handler_stop(err),
+            Some(HandlerStop::TextOverLimit { .. } | HandlerStop::MatchStateOverLimit { .. })
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn match_state_overrun_is_a_memory_error_and_can_bail_out_gracefully() {
+        let error =
+            RewritingError::ContentHandlerError(Box::new(HandlerStop::MatchStateOverLimit {
+                limit_bytes: 512,
+            }));
+        assert!(is_memory_limit(&error));
+        let event = stream_error(&error);
+        assert_eq!(event.code, pb::ParseErrorCode::MemoryLimitExceeded as i32);
+        assert!(event.message.contains("open-match tracking"));
+    }
 }
