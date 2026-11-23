@@ -469,6 +469,7 @@ async fn drive(
     let started = pb::extract_response::Event::Started(pb::ExtractStarted {
         encoding,
         rule_count: u32::try_from(compiled.rules.len()).unwrap_or(u32::MAX),
+        max_memory_bytes: compiled.max_memory_bytes as u64,
     });
     if !outbound.push(started) {
         return Ending::Gone;
@@ -1035,7 +1036,10 @@ fn element_handlers(
                     }
                     Ok(())
                 }));
-                debug_assert!(registered.is_ok());
+                // Unregistered, the match would never leave the open-match
+                // stack and a requested end tag would never arrive, so a
+                // refusal ends the run instead of being dropped.
+                registered?;
             }
 
             Ok(())

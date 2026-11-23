@@ -150,7 +150,8 @@ message MemoryLimits {
   // unlimited.
   //
   // The server also has a ceiling of its own, and a larger value is cut to
-  // it, as is the default when the ceiling is lower.
+  // it, as is the default when the ceiling is lower. The limit in force is
+  // reported in `ExtractStarted.max_memory_bytes`.
   uint64 max_bytes = 1;
 
   // What to do when `max_bytes` is reached.
@@ -248,7 +249,8 @@ message ExtractRule {
   // Use `ValidateSelectors` to check before spending an upload.
   string selector = 2;
 
-  // What to report on a match. At least one is required.
+  // What to report on a match. At least one is required. CAPTURE_UNSPECIFIED
+  // or a value this server does not know is INVALID_ARGUMENT.
   repeated Capture captures = 3;
 }
 

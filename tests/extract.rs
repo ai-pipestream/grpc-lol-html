@@ -996,6 +996,42 @@ async fn a_character_split_across_chunks_is_not_counted_as_malformed() {
     }
 }
 
+/// A memory limit above the server's ceiling is cut to it. The stream says
+/// what limit is in force, so the caller is not left believing it raised it.
+#[tokio::test]
+async fn the_started_event_reports_the_memory_limit_in_force() {
+    let client = start_server().await;
+    let page = b"<html><body><p>hello</p></body></html>";
+    let with_limit = |max_bytes| pb::ExtractOptions {
+        limits: Some(pb::MemoryLimits {
+            max_bytes,
+            ..Default::default()
+        }),
+        ..everything()
+    };
+    let limit_in_force =
+        |events: &[pb::ExtractResponse]| only!(events, Event::Started)[0].max_memory_bytes;
+
+    // Nothing asked for: the server's default.
+    let events = extract(&client, page, everything(), usize::MAX)
+        .await
+        .expect("extract should not fail");
+    let ceiling = limit_in_force(&events);
+    assert_eq!(ceiling, 64 * 1024 * 1024);
+
+    // Less than the ceiling: what was asked for.
+    let events = extract(&client, page, with_limit(1024 * 1024), usize::MAX)
+        .await
+        .expect("extract should not fail");
+    assert_eq!(limit_in_force(&events), 1024 * 1024);
+
+    // More than the ceiling: the ceiling, and the stream says so.
+    let events = extract(&client, page, with_limit(1 << 40), usize::MAX)
+        .await
+        .expect("extract should not fail");
+    assert_eq!(limit_in_force(&events), ceiling);
+}
+
 /// Explicitly naming the encoding works too, and without needing the meta tag.
 #[tokio::test]
 async fn an_explicit_encoding_label_is_honoured() {
@@ -1262,8 +1298,10 @@ async fn every_capture_has_a_visible_effect() {
 /// Options that match everything and ask for every kind of text.
 fn every_text_type() -> pb::ExtractOptions {
     pb::ExtractOptions {
+        // The zero value is not a kind of text and the server refuses it.
         text_types: ALL_TEXT_TYPES
             .iter()
+            .filter(|text_type| **text_type != pb::TextType::Unspecified)
             .map(|text_type| *text_type as i32)
             .collect(),
         ..everything()
