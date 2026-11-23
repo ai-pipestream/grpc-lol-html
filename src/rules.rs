@@ -234,7 +234,7 @@ pub fn compile(
             .as_ref()
             .is_some_and(|limits| limits.graceful_bail_out),
         raw_text_chunks: options.raw_text_chunks,
-        text_types: text_types(&options.text_types),
+        text_types: text_types(&options.text_types)?,
     })
 }
 
@@ -355,6 +355,19 @@ fn compile_rule(rule: &pb::ExtractRule) -> Result<CompiledRule, Status> {
         ))
     })?;
 
+    // A value this server does not know, or the zero value, captures
+    // nothing. Letting it through would open a stream whose matches come
+    // back empty with nothing to say why.
+    if let Some(unusable) = rule.captures.iter().find(|value| {
+        !matches!(pb::Capture::try_from(**value), Ok(capture) if capture != pb::Capture::Unspecified)
+    }) {
+        return Err(Status::invalid_argument(format!(
+            "rule `{}` has captures value {unusable}, which this server does not know \
+             how to capture; send only the captures defined in the contract",
+            rule.id
+        )));
+    }
+
     let has = |capture: pb::Capture| rule.captures.contains(&(capture as i32));
 
     Ok(CompiledRule {
@@ -434,26 +447,32 @@ fn preallocated_buffer_bytes(limits: Option<&pb::MemoryLimits>, max_memory_bytes
 /// crafted one cannot exhaust the host.
 pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Resolve the requested text types, applying the default when none are named
-/// and dropping anything unrecognized.
-fn text_types(requested: &[i32]) -> Vec<pb::TextType> {
+/// Resolve the requested text types, applying the default when none are
+/// named.
+///
+/// A value this server does not know, or the zero value, is refused rather
+/// than dropped: dropping it would hand the caller text kinds it did not ask
+/// for and none of the one it did.
+fn text_types(requested: &[i32]) -> Result<Vec<pb::TextType>, Status> {
     if requested.is_empty() {
-        return DEFAULT_TEXT_TYPES.to_vec();
+        return Ok(DEFAULT_TEXT_TYPES.to_vec());
     }
 
-    let mut types: Vec<pb::TextType> = requested
-        .iter()
-        .filter_map(|value| pb::TextType::try_from(*value).ok())
-        .filter(|text_type| *text_type != pb::TextType::Unspecified)
-        .collect();
+    let mut types = Vec::with_capacity(requested.len());
+    for value in requested {
+        match pb::TextType::try_from(*value) {
+            Ok(text_type) if text_type != pb::TextType::Unspecified => types.push(text_type),
+            _ => {
+                return Err(Status::invalid_argument(format!(
+                    "text_types value {value} is not a text type this server knows; \
+                     send only the text types defined in the contract, or none for the default"
+                )));
+            }
+        }
+    }
     types.sort_unstable_by_key(|text_type| *text_type as i32);
     types.dedup();
-
-    if types.is_empty() {
-        DEFAULT_TEXT_TYPES.to_vec()
-    } else {
-        types
-    }
+    Ok(types)
 }
 
 /// Compile every selector and report the ones that failed.
@@ -775,16 +794,68 @@ mod tests {
 
     #[test]
     fn text_types_default_to_prose_and_titles() {
-        assert_eq!(text_types(&[]), DEFAULT_TEXT_TYPES.to_vec());
-        // An all-unrecognized list falls back rather than silencing all text.
-        assert_eq!(text_types(&[9999]), DEFAULT_TEXT_TYPES.to_vec());
+        assert_eq!(text_types(&[]).unwrap(), DEFAULT_TEXT_TYPES.to_vec());
+    }
+
+    /// A text type this server does not know, or the zero value, used to be
+    /// dropped, and a list of nothing else became the default: the caller got
+    /// text kinds it did not ask for and none of the one it did.
+    #[test]
+    fn a_text_type_the_server_does_not_know_is_refused() {
+        let script = pb::TextType::ScriptData as i32;
+        for unusable in [9999, pb::TextType::Unspecified as i32] {
+            for list in [vec![unusable], vec![script, unusable]] {
+                let options = pb::ExtractOptions {
+                    rules: vec![rule("a", "div")],
+                    text_types: list,
+                    ..Default::default()
+                };
+                let err = rejection(&options);
+                assert_eq!(err.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    err.message()
+                        .contains(&format!("text_types value {unusable}")),
+                    "{}",
+                    err.message()
+                );
+            }
+        }
+    }
+
+    /// A rule whose only capture is one this server does not know passed the
+    /// "no captures" check and then captured nothing, so every match came
+    /// back empty with no word of why.
+    #[test]
+    fn a_capture_the_server_does_not_know_is_refused() {
+        let tag_name = pb::Capture::TagName as i32;
+        for unusable in [9999, pb::Capture::Unspecified as i32] {
+            for list in [vec![unusable], vec![tag_name, unusable]] {
+                let options = pb::ExtractOptions {
+                    rules: vec![pb::ExtractRule {
+                        captures: list,
+                        ..rule("links", "a")
+                    }],
+                    ..Default::default()
+                };
+                let err = rejection(&options);
+                assert_eq!(err.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    err.message().contains("rule `links`")
+                        && err
+                            .message()
+                            .contains(&format!("captures value {unusable}")),
+                    "{}",
+                    err.message()
+                );
+            }
+        }
     }
 
     #[test]
     fn text_types_are_deduplicated() {
         let script = pb::TextType::ScriptData as i32;
         assert_eq!(
-            text_types(&[script, script]),
+            text_types(&[script, script]).unwrap(),
             vec![pb::TextType::ScriptData]
         );
     }

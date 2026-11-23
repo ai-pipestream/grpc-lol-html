@@ -78,7 +78,8 @@ pub struct MemoryLimits {
     /// unlimited.
     ///
     /// The server also has a ceiling of its own, and a larger value is cut to
-    /// it, as is the default when the ceiling is lower.
+    /// it, as is the default when the ceiling is lower. The limit in force is
+    /// reported in `ExtractStarted.max_memory_bytes`.
     #[prost(uint64, tag="1")]
     pub max_bytes: u64,
     /// What to do when `max_bytes` is reached.
@@ -141,7 +142,8 @@ pub struct ExtractRule {
     /// Use `ValidateSelectors` to check before spending an upload.
     #[prost(string, tag="2")]
     pub selector: ::prost::alloc::string::String,
-    /// What to report on a match. At least one is required.
+    /// What to report on a match. At least one is required. CAPTURE_UNSPECIFIED
+    /// or a value this server does not know is INVALID_ARGUMENT.
     #[prost(enumeration="Capture", repeated, tag="3")]
     pub captures: ::prost::alloc::vec::Vec<i32>,
 }
@@ -609,6 +611,8 @@ pub struct ExtractOptions {
     /// The default exists because concatenating every text event is the obvious
     /// thing to do and silently indexes minified JavaScript and CSS as body
     /// copy. Ask for SCRIPT_DATA or RAW_TEXT explicitly if you want them.
+    /// TEXT_TYPE_UNSPECIFIED or a value this server does not know is
+    /// INVALID_ARGUMENT.
     #[prost(enumeration="TextType", repeated, tag="9")]
     pub text_types: ::prost::alloc::vec::Vec<i32>,
 }
@@ -673,6 +677,13 @@ pub struct ExtractStarted {
     /// opened with a rule that failed to compile.
     #[prost(uint32, tag="2")]
     pub rule_count: u32,
+    /// The memory limit in force for this stream, in bytes: the requested
+    /// `MemoryLimits.max_bytes`, or the server's default when none was asked
+    /// for, cut to the server's ceiling. A caller that asked for more than the
+    /// ceiling sees here that it did not get it, before a run that later ends
+    /// with MEMORY_LIMIT_EXCEEDED or `bailed_out`.
+    #[prost(uint64, tag="3")]
+    pub max_memory_bytes: u64,
 }
 /// ElementMatched reports one element matching one rule.
 ///
