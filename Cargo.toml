@@ -17,6 +17,7 @@ exclude = ["bench", "demos"]
 
 [dependencies]
 encoding_rs = "0.8.35" # Charset label lookup, the same version lol-html uses.
+mime = "0.3.17" # Reads `<meta http-equiv>` charsets the way lol-html does.
 htmlize = { version = "1", features = ["unescape"] }
 lol_html = "3.0.1"
 mimalloc = "0.1.52"

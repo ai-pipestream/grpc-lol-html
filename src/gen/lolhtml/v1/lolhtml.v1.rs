@@ -663,9 +663,10 @@ pub mod extract_response {
 /// ExtractStarted opens every response stream.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExtractStarted {
-    /// The encoding actually in use, which is the requested one resolved to a
-    /// canonical label. If `adjust_charset_on_meta_tag` is set, a `<meta
-    /// charset>` later in the document may still change it.
+    /// The encoding in use when the parse starts, which is the requested one
+    /// resolved to a canonical label. If `adjust_charset_on_meta_tag` is set, a
+    /// `<meta charset>` later in the document may still change it;
+    /// `ExtractFinished.encoding` reports the one the document ended in.
     #[prost(string, tag="1")]
     pub encoding: ::prost::alloc::string::String,
     /// How many rules compiled. Equals the number submitted; a stream is never
@@ -841,6 +842,22 @@ pub struct ExtractFinished {
     /// false.
     #[prost(string, tag="4")]
     pub bail_out_reason: ::prost::alloc::string::String,
+    /// How many byte sequences in the parsed document were not valid in the
+    /// encoding in use where they stood. Each one that fell inside text or an
+    /// attribute value the rules captured was delivered as U+FFFD, the
+    /// replacement character, so a count above zero means some captured text
+    /// may not be what the document said.
+    ///
+    /// The usual cause is a document sent under the wrong `encoding`: a
+    /// windows-1252 or Shift_JIS page parsed as UTF-8 has one such sequence for
+    /// nearly every non-ASCII character. Zero means every byte decoded.
+    #[prost(uint64, tag="5")]
+    pub malformed_sequences: u64,
+    /// The encoding in use when the document ended, as a canonical label. The
+    /// same as `ExtractStarted.encoding` unless `adjust_charset_on_meta_tag` was
+    /// set and a `<meta charset>` changed it.
+    #[prost(string, tag="6")]
+    pub encoding: ::prost::alloc::string::String,
 }
 /// ValidateSelectorsRequest asks whether a set of selectors compiles.
 #[derive(Clone, PartialEq, ::prost::Message)]
