@@ -327,6 +327,7 @@ dependencies = [
  "htmlize",
  "lol_html",
  "mimalloc",
+ "mime",
  "prost",
  "tokio",
  "tokio-stream",

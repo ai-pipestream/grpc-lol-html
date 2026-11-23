@@ -326,6 +326,16 @@ nothing in between depends on what the document says or how long it is.
 bytes, so UTF-16LE/BE, ISO-2022-JP and `replacement` are rejected with
 `INVALID_ARGUMENT`. Transcode first.
 
+**A wrong encoding is counted, not hidden.** lol-html replaces a byte
+sequence that is not valid in the encoding in use with U+FFFD, so a
+windows-1252 page sent with no `encoding` comes back with every accented
+letter replaced. `finished.malformed_sequences` is how many sequences in the
+document did not decode, and `finished.encoding` is the encoding the document
+ended in, which differs from `started.encoding` when
+`adjust_charset_on_meta_tag` honoured a `<meta charset>`. Zero means every
+byte decoded; anything else means the captured text may not be what the
+document said, and the usual fix is to send the right `encoding`.
+
 **Chunk size is capped** at 100 MiB, tunable with
 `GRPC_LOL_HTML_MAX_CHUNK_BYTES`. This is not a document size limit; a document
 is any number of chunks and has no ceiling. It bounds how much one message

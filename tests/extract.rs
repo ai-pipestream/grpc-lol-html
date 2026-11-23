@@ -915,6 +915,85 @@ async fn a_meta_charset_can_override_the_declared_encoding() {
         .map(|t| t.text.as_str())
         .collect();
     assert!(!raw.contains("Привет, мир"));
+
+    // And the trailers say which of the two happened: the honoured switch
+    // ends in windows-1251 with every byte decoded, the ignored one ends in
+    // UTF-8 with the Cyrillic counted as what did not decode.
+    let adjusted = only!(adjusted, Event::Finished)[0];
+    assert_eq!(adjusted.encoding, "windows-1251");
+    assert_eq!(adjusted.malformed_sequences, 0);
+    let unadjusted = only!(unadjusted, Event::Finished)[0];
+    assert_eq!(unadjusted.encoding, "UTF-8");
+    assert!(
+        unadjusted.malformed_sequences > 0,
+        "windows-1251 text read as UTF-8 is replaced, and the trailer has to say so"
+    );
+}
+
+/// Bytes that are not valid in the encoding the document is parsed as reach
+/// the caller as U+FFFD. The trailer counts them, so a wrong `encoding` is
+/// not a clean success.
+#[tokio::test]
+async fn bytes_that_do_not_decode_are_counted_in_the_trailer() {
+    let client = start_server().await;
+    // windows-1252: "café", "für" and "Straße", one in an attribute value.
+    let page = b"<html><body><p title=\"caf\xe9\">f\xfcr die Stra\xdfe</p></body></html>";
+
+    // No encoding given, so it is parsed as UTF-8 and all three are replaced.
+    let events = extract(&client, page, everything(), usize::MAX)
+        .await
+        .expect("extract should not fail");
+    let text: String = only!(events, Event::Text)
+        .iter()
+        .map(|t| t.text.as_str())
+        .collect();
+    assert!(text.contains("f\u{fffd}r die Stra\u{fffd}e"), "{text:?}");
+    let finished = only!(events, Event::Finished)[0];
+    assert_eq!(finished.encoding, "UTF-8");
+    assert_eq!(
+        finished.malformed_sequences, 3,
+        "three bytes were replaced with U+FFFD and the trailer has to count them"
+    );
+
+    // The same bytes under the encoding they were written in: nothing to report.
+    let events = extract(
+        &client,
+        page,
+        pb::ExtractOptions {
+            encoding: "windows-1252".to_owned(),
+            ..everything()
+        },
+        usize::MAX,
+    )
+    .await
+    .expect("extract should not fail");
+    let text: String = only!(events, Event::Text)
+        .iter()
+        .map(|t| t.text.as_str())
+        .collect();
+    assert!(text.contains("für die Straße"), "{text:?}");
+    let finished = only!(events, Event::Finished)[0];
+    assert_eq!(finished.encoding, "windows-1252");
+    assert_eq!(finished.malformed_sequences, 0);
+}
+
+/// A character whose bytes fall either side of a chunk boundary is one sound
+/// character, not two broken ones, however the upload is cut.
+#[tokio::test]
+async fn a_character_split_across_chunks_is_not_counted_as_malformed() {
+    let client = start_server().await;
+    let page = "<html><body><p>Привет, мир — café</p></body></html>".as_bytes();
+    for chunk_size in [1, 2, 3, 7, usize::MAX] {
+        let events = extract(&client, page, everything(), chunk_size)
+            .await
+            .expect("extract should not fail");
+        let finished = only!(events, Event::Finished)[0];
+        assert_eq!(
+            finished.malformed_sequences, 0,
+            "chunks of {chunk_size} bytes"
+        );
+        assert_eq!(finished.encoding, "UTF-8");
+    }
 }
 
 /// Explicitly naming the encoding works too, and without needing the meta tag.

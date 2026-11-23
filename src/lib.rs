@@ -24,6 +24,7 @@
 //!   overlook: every `TextType`, every `Namespace`, per-attribute source
 //!   spans, and both error taxonomies.
 
+pub mod charset;
 pub mod convert;
 pub mod errors;
 pub mod outbound;

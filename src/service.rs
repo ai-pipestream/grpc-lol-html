@@ -54,7 +54,7 @@ use crate::errors::HandlerStop;
 use crate::outbound::{self, Delivery, Outbound, OutboundStream, SendError};
 use crate::proto::v1 as pb;
 use crate::rules::{CompiledOptions, CompiledRule};
-use crate::{convert, errors, rules};
+use crate::{charset, convert, errors, rules};
 
 /// Largest single inbound chunk accepted, in bytes.
 ///
@@ -457,7 +457,9 @@ async fn drive(
             limit: compiled.max_memory_bytes,
         }),
     };
-    let settings = build_settings(&compiled, &sink, &counters);
+    // Counts what lol-html replaces with U+FFFD, so the trailer can say so.
+    let mut charset = charset::Tracker::new(compiled.encoding.into());
+    let settings = build_settings(&compiled, &sink, &counters, &charset.switch());
     let mut rewriter = HtmlRewriter::new(settings, |_: &[u8]| {});
 
     // The sink is cloned into every handler; this original would otherwise
@@ -553,9 +555,14 @@ async fn drive(
         // parse produces: the handlers wait in here for room in the outbound
         // queue. Neither belongs on an async worker.
         let size = chunk.len() as u64;
-        let (returned, written) = match tokio::task::spawn_blocking(move || {
+        let (returned, tracked, written) = match tokio::task::spawn_blocking(move || {
             let written = rewriter.write(&chunk);
-            (rewriter, written)
+            // Only a chunk the rewriter took is part of what was parsed, and
+            // only after it is the charset its `<meta>` declared known.
+            if written.is_ok() {
+                charset.feed(&chunk);
+            }
+            (rewriter, charset, written)
         })
         .await
         {
@@ -566,6 +573,7 @@ async fn drive(
             }
         };
         rewriter = returned;
+        charset = tracked;
 
         if let Err(err) = written {
             if let Some(ending) = stopped_by_client(&err, outbound, limits, bytes_parsed) {
@@ -580,6 +588,7 @@ async fn drive(
                 &compiled,
                 bytes_parsed,
                 &counters,
+                &charset,
                 &started_at,
             );
             return Ending::Early;
@@ -609,22 +618,28 @@ async fn drive(
             &compiled,
             bytes_parsed,
             &counters,
+            &charset,
             &started_at,
         );
         return Ending::Complete;
     }
 
     let matches = total_matches(&counters);
+    let malformed_sequences = charset.finish();
     let finished = pb::extract_response::Event::Finished(pb::ExtractFinished {
         bytes_parsed,
         matches_by_rule: tally(&compiled, &counters),
         bailed_out: false,
         bail_out_reason: String::new(),
+        malformed_sequences,
+        encoding: charset.encoding_name().to_owned(),
     });
     outbound.push(finished);
     tracing::info!(
         bytes_parsed,
         matches,
+        malformed_sequences,
+        encoding = charset.encoding_name(),
         bailed_out = false,
         duration_ms = started_at.elapsed().as_millis() as u64,
         "stream finished"
@@ -758,6 +773,7 @@ fn finish_with_error(
     compiled: &CompiledOptions,
     bytes_parsed: u64,
     counters: &[Arc<AtomicU64>],
+    charset: &charset::Tracker,
     started_at: &Instant,
 ) {
     let event = if compiled.graceful_bail_out && errors::is_memory_limit(err) {
@@ -766,6 +782,10 @@ fn finish_with_error(
             matches_by_rule: tally(compiled, counters),
             bailed_out: true,
             bail_out_reason: err.to_string(),
+            // Of the bytes parsed: the run stopped before the end of the
+            // input, so a sequence still open is not counted against it.
+            malformed_sequences: charset.malformed(),
+            encoding: charset.encoding_name().to_owned(),
         })
     } else {
         pb::extract_response::Event::Error(errors::stream_error(err))
@@ -859,6 +879,7 @@ fn build_settings(
     compiled: &CompiledOptions,
     sink: &Sink,
     counters: &[Arc<AtomicU64>],
+    charset_switch: &charset::Switch,
 ) -> Settings<'static, 'static> {
     let mut settings = Settings::new_send()
         .with_encoding(compiled.encoding)
@@ -866,6 +887,13 @@ fn build_settings(
         .with_strict(compiled.strict)
         .with_enable_esi_tags(compiled.enable_esi_tags)
         .with_adjust_charset_on_meta_tag(compiled.adjust_charset_on_meta_tag);
+
+    if compiled.adjust_charset_on_meta_tag {
+        settings = settings.append_element_content_handler((
+            std::borrow::Cow::Owned("meta".parse().expect("`meta` is a valid selector")),
+            charset_handlers(Arc::clone(charset_switch)),
+        ));
+    }
 
     for (rule, counter) in compiled.rules.iter().zip(counters) {
         settings = settings.append_element_content_handler((
@@ -880,6 +908,32 @@ fn build_settings(
     }
 
     settings
+}
+
+/// Watch `<meta>` for the charset switch lol-html makes on its own.
+///
+/// lol-html keeps the encoding it switched to private, so this applies the
+/// same rule to the same tags and hands the result to the tracker: the first
+/// `<meta>` that declares a usable encoding wins, and the encoding applies
+/// from the byte after that tag.
+fn charset_handlers(switch: charset::Switch) -> ElementContentHandlers<'static> {
+    let mut found = false;
+    ElementContentHandlers::default().element(move |el: &mut lol_html::send::Element<'_, '_>| {
+        if found {
+            return Ok(());
+        }
+        let declared = charset::declared_by_meta(
+            el.get_attribute("charset").as_deref(),
+            el.get_attribute("http-equiv").as_deref(),
+            el.get_attribute("content").as_deref(),
+        );
+        if let Some(encoding) = declared {
+            found = true;
+            *switch.lock().expect("charset switch lock") =
+                Some((el.source_location().bytes().end, encoding));
+        }
+        Ok(())
+    })
 }
 
 /// Build the per-selector handlers for one rule.
